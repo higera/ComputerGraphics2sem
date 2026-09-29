@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <cwchar>
 #include <DirectXMath.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -25,7 +26,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
     m_input = std::make_unique<Input>();
     m_input->Reset();
 
-    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-3: Tessellation + Displacement + Normal Maps"))
+    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-4"))
         return false;
 
     m_dx12 = std::make_unique<D3D12Context>();
@@ -62,6 +63,7 @@ int App::Run()
 
         Update(dt);
         if (m_dx12) m_dx12->Draw(dt);
+        UpdateWindowTitle(dt);
     }
     return 0;
 }
@@ -121,6 +123,39 @@ void App::Update(float dt)
     m_dx12->SetCamera(m_camPos, m_camYaw, m_camPitch);
 }
 
+void App::UpdateWindowTitle(float dt)
+{
+    if (!m_dx12 || !m_window) return;
+
+    m_fpsTimer += dt;
+    ++m_fpsFrames;
+    if (m_fpsTimer < 0.25f)
+        return;
+
+    m_fps = m_fpsFrames / m_fpsTimer;
+    m_fpsTimer = 0.f;
+    m_fpsFrames = 0;
+
+    wchar_t buf[256];
+    if (m_dx12->ScatterModeOn())
+    {
+        swprintf(buf, 256,
+            L"Lab-4 | Scatter | FPS %.0f | F(frustum): %ls | O(octree): %ls | I(instancing): %ls | "
+            L"Visible %u/%u | AABB tests %u | Cull %.1f us | Draw calls %u",
+            m_fps,
+            m_dx12->FrustumCullingOn() ? L"ON" : L"OFF",
+            m_dx12->OctreeCullingOn()  ? L"ON" : L"OFF",
+            m_dx12->InstancingOn()     ? L"ON" : L"OFF",
+            m_dx12->ScatterVisibleCount(), m_dx12->ScatterTotalCount(),
+            m_dx12->LastAabbTests(), m_dx12->LastCullMicroseconds(), m_dx12->LastDrawCalls());
+    }
+    else
+    {
+        swprintf(buf, 256, L"Lab-4 | Deferred (Tab -> scatter) | FPS %.0f", m_fps);
+    }
+    SetWindowTextW(m_window->GetHwnd(), buf);
+}
+
 LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)
@@ -135,9 +170,10 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (m_input) m_input->OnKeyDown((uint32_t)wparam);
         if (!(lparam & (1 << 30)) && m_dx12)
         {
-            if (wparam == 'F') m_dx12->ToggleWireframe();
-            if (wparam == 'H') m_dx12->ToggleDisplacement();
-            if (wparam == 'N') m_dx12->ToggleNormalMap();
+            if (wparam == VK_TAB) m_dx12->ToggleSceneMode();
+            if (wparam == 'F')    m_dx12->ToggleFrustumCulling();
+            if (wparam == 'O')    m_dx12->ToggleOctreeCulling();
+            if (wparam == 'I')    m_dx12->ToggleInstancing();
         }
         return 0;
 

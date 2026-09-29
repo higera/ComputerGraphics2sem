@@ -10,6 +10,20 @@ bool D3D12Context::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     return m_renderer->Initialize(hwnd, width, height);
 }
 
+void D3D12Context::ToggleSceneMode()      { if (m_renderer) m_renderer->ToggleSceneMode(); }
+void D3D12Context::ToggleFrustumCulling() { if (m_renderer) m_renderer->ToggleFrustumCulling(); }
+void D3D12Context::ToggleOctreeCulling()  { if (m_renderer) m_renderer->ToggleOctreeCulling(); }
+void D3D12Context::ToggleInstancing()     { if (m_renderer) m_renderer->ToggleInstancing(); }
+bool D3D12Context::FrustumCullingOn() const { return m_renderer ? m_renderer->FrustumCullingOn() : false; }
+bool D3D12Context::OctreeCullingOn()  const { return m_renderer ? m_renderer->OctreeCullingOn()  : false; }
+bool D3D12Context::ScatterModeOn()    const { return m_renderer ? m_renderer->ScatterModeOn()    : false; }
+uint32_t D3D12Context::ScatterVisibleCount() const { return m_renderer ? m_renderer->ScatterVisibleCount() : 0; }
+uint32_t D3D12Context::ScatterTotalCount()   const { return m_renderer ? m_renderer->ScatterTotalCount()   : 0; }
+bool D3D12Context::InstancingOn()             const { return m_renderer ? m_renderer->InstancingOn() : false; }
+float D3D12Context::LastCullMicroseconds()    const { return m_renderer ? m_renderer->LastCullMicroseconds() : 0.f; }
+uint32_t D3D12Context::LastAabbTests()        const { return m_renderer ? m_renderer->LastAabbTests() : 0; }
+uint32_t D3D12Context::LastDrawCalls()        const { return m_renderer ? m_renderer->LastDrawCalls() : 0; }
+
 void D3D12Context::Shutdown()
 {
     if (m_renderer)
@@ -35,22 +49,4 @@ void D3D12Context::SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float p
 {
     if (m_renderer)
         m_renderer->SetCamera(eyePos, yaw, pitch);
-}
-
-void D3D12Context::ToggleWireframe()
-{
-    if (m_renderer)
-        m_renderer->ToggleWireframe();
-}
-
-void D3D12Context::ToggleDisplacement()
-{
-    if (m_renderer)
-        m_renderer->ToggleDisplacement();
-}
-
-void D3D12Context::ToggleNormalMap()
-{
-    if (m_renderer)
-        m_renderer->ToggleNormalMap();
 }

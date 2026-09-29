@@ -14,6 +14,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "AABB.h"
+#include "Frustum.h"
+#include "Octree.h"
 
 class GBuffer;
 
@@ -36,10 +39,21 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
-    void ToggleWireframe() { m_wireframe = !m_wireframe; }
 
-    void ToggleDisplacement() { m_displacementEnabled = !m_displacementEnabled; }
-    void ToggleNormalMap() { m_normalMapEnabled = !m_normalMapEnabled; }
+    void ToggleSceneMode();
+    void ToggleFrustumCulling();
+    void ToggleOctreeCulling();
+    void ToggleInstancing();
+    bool FrustumCullingOn() const { return m_useFrustumCulling; }
+    bool OctreeCullingOn()  const { return m_useOctreeCulling; }
+    bool ScatterModeOn()    const { return m_sceneMode == 1; }
+    uint32_t ScatterVisibleCount() const { return (uint32_t)m_scatterVisible.size(); }
+    uint32_t ScatterTotalCount()   const { return (uint32_t)m_scatterInstances.size(); }
+
+    bool     InstancingOn()      const { return m_useInstancing; }
+    float    LastCullMicroseconds() const { return m_lastCullMicroseconds; }
+    uint32_t LastAabbTests()     const { return m_lastAabbTests; }
+    uint32_t LastDrawCalls()     const { return m_lastDrawCalls; }
 
 private:
     struct MaterialConstants
@@ -52,10 +66,7 @@ private:
     {
         uint32_t IndexCount = 0;
         uint32_t StartIndexLocation = 0;
-        uint32_t DiffuseTex = 0;
-        uint32_t NormalTex = 1;
-        uint32_t DispTex = 2;
-        uint32_t DescriptorIndex = 0;
+        uint32_t TextureIndex = 0;
         MaterialConstants Material;
     };
 
@@ -66,8 +77,6 @@ private:
         DirectX::XMFLOAT4X4 InvViewProj{};
         DirectX::XMFLOAT4 EyePosW{ 0.f, 0.f, 0.f, 1.f };
         DirectX::XMFLOAT4 RenderTargetSize{ 1.f, 1.f, 1.f, 1.f };
-        DirectX::XMFLOAT4 TessParams{ 3.f, 25.f, 1.f, 6.f };
-        DirectX::XMFLOAT4 DispParams{ 0.10f, 0.5f, 0.f, 0.f };
     };
 
     struct alignas(16) GpuLight
@@ -144,15 +153,9 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryWirePSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
-    bool m_wireframe = false;
-    bool m_displacementEnabled = true;
-    bool m_normalMapEnabled = true;
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryHS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryDS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;
@@ -173,12 +176,50 @@ private:
     uint8_t* m_mappedLightConstants = nullptr;
 
     std::vector<GpuLight> m_sceneLights;
-    uint32_t m_orbitingLightIndex = UINT32_MAX;
 
     DirectX::XMFLOAT4X4 m_world{};
     DirectX::XMFLOAT4X4 m_view{};
     DirectX::XMFLOAT4X4 m_proj{};
-    DirectX::XMFLOAT3 m_eyePos{ -5.f, 1.f, -5.f };
+    DirectX::XMFLOAT3 m_eyePos{ -30.f, 25.f, -30.f };
 
     float m_time = 0.f;
+    static constexpr uint32_t kScatterGridSide = 32;
+    static constexpr uint32_t kScatterInstanceCount = kScatterGridSide * kScatterGridSide;
+
+    int m_sceneMode = 0;
+    bool m_useFrustumCulling = true;
+    bool m_useOctreeCulling = false;
+    bool m_useInstancing = false;
+
+    float    m_lastCullMicroseconds = 0.f;
+    uint32_t m_lastAabbTests = 0;
+    uint32_t m_lastDrawCalls = 0;
+
+    struct ScatterInstance
+    {
+        DirectX::XMFLOAT4X4 World;
+        DirectX::XMFLOAT4X4 WorldT;
+        AABB                WorldBounds;
+    };
+    std::vector<ScatterInstance> m_scatterInstances;
+    std::vector<uint32_t>        m_scatterVisible;
+
+    Octree m_scatterOctree;
+    bool   m_scatterOctreeBuilt = false;
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_scatterRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_scatterPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_scatterInstancedPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_scatterInstancedVS;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_instanceBuffer;
+    uint8_t* m_mappedInstanceBuffer = nullptr;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_scatterVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_scatterPS;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatterViewCB;
+    uint8_t* m_mappedScatterViewCB = nullptr;
+
+    AABB m_meshBounds;
+
+    bool BuildScatterResources();
+    void UpdateScatterVisible();
 };

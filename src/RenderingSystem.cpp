@@ -14,6 +14,7 @@
 #include <cctype>
 #include <wincodec.h>
 #include <objbase.h>
+#include <random>
 
 using namespace DirectX;
 using Microsoft::WRL::ComPtr;
@@ -362,8 +363,6 @@ namespace
     struct MtlData
     {
         std::string diffusePath;
-        std::string normalPath;
-        std::string dispPath;
         XMFLOAT3 kd{ 1.f, 1.f, 1.f };
         XMFLOAT3 ks{ 0.18f, 0.18f, 0.18f };
         float ns = 32.f;
@@ -413,24 +412,6 @@ namespace
                     last = token;
                 if (!last.empty())
                     materials[currentMaterial].diffusePath = JoinPath(baseDir, last);
-            }
-            else if ((command == "map_Bump" || command == "map_bump" || command == "bump") && !currentMaterial.empty())
-            {
-                std::string token;
-                std::string last;
-                while (stream >> token)
-                    last = token;
-                if (!last.empty())
-                    materials[currentMaterial].normalPath = JoinPath(baseDir, last);
-            }
-            else if ((command == "disp" || command == "map_disp") && !currentMaterial.empty())
-            {
-                std::string token;
-                std::string last;
-                while (stream >> token)
-                    last = token;
-                if (!last.empty())
-                    materials[currentMaterial].dispPath = JoinPath(baseDir, last);
             }
         }
 
@@ -721,7 +702,7 @@ namespace
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource = texture;
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         commandList->ResourceBarrier(1, &barrier);
 
@@ -771,7 +752,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     SetCamera(m_eyePos, 1.f, 0.f);
 
     const float aspect = (m_height > 0) ? static_cast<float>(m_width) / static_cast<float>(m_height) : 1.f;
-    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 1000.f));
+    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 200.f));
 
     BuildShaders();
     BuildRootSignature();
@@ -785,6 +766,8 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     UpdatePassConstants();
     UpdateLightConstants(0.f);
     BuildPSOs();
+    if (!BuildScatterResources())
+        return false;
 
     m_initialized = true;
     return true;
@@ -815,6 +798,18 @@ void RenderingSystem::Shutdown()
     {
         m_gBuffer->Shutdown();
         m_gBuffer.reset();
+    }
+
+    if (m_scatterViewCB && m_mappedScatterViewCB)
+    {
+        m_scatterViewCB->Unmap(0, nullptr);
+        m_mappedScatterViewCB = nullptr;
+    }
+
+    if (m_instanceBuffer && m_mappedInstanceBuffer)
+    {
+        m_instanceBuffer->Unmap(0, nullptr);
+        m_mappedInstanceBuffer = nullptr;
     }
 
     if (m_fenceEvent)
@@ -853,7 +848,7 @@ void RenderingSystem::OnResize(uint32_t width, uint32_t height)
     m_scissorRect = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
 
     const float aspect = static_cast<float>(m_width) / static_cast<float>(m_height);
-    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 1000.f));
+    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 200.f));
 
     UpdatePassConstants();
 }
@@ -866,6 +861,99 @@ void RenderingSystem::Draw(float dt)
     UpdatePassConstants();
     UpdateLightConstants(dt);
 
+    if (m_sceneMode == 1)
+    {
+        UpdateScatterVisible();
+
+        ThrowIfFailed(m_commandAllocator->Reset(), "Reset allocator (scatter)");
+        ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset list (scatter)");
+
+        D3D12_RESOURCE_BARRIER toRT{};
+        toRT.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toRT.Transition.pResource   = CurrentBackBuffer();
+        toRT.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        toRT.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toRT.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_commandList->ResourceBarrier(1, &toRT);
+
+        const auto rtv = CurrentBackBufferRTV();
+        const auto dsv = m_gBuffer->GetDsv();
+        const float clear[4] = { 0.10f, 0.15f, 0.20f, 1.f };
+        m_commandList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        m_commandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
+
+        m_commandList->RSSetViewports(1, &m_viewport);
+        m_commandList->RSSetScissorRects(1, &m_scissorRect);
+        m_commandList->SetGraphicsRootSignature(m_scatterRootSig.Get());
+        m_commandList->SetPipelineState(m_scatterPSO.Get());
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
+        m_commandList->IASetIndexBuffer(&m_indexBufferView);
+
+        ID3D12DescriptorHeap* heaps[] = { m_textureHeap.Get() };
+        m_commandList->SetDescriptorHeaps(1, heaps);
+
+        m_commandList->SetGraphicsRootConstantBufferView(0, m_scatterViewCB->GetGPUVirtualAddress());
+
+        const auto textureHeapStart = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
+        m_lastDrawCalls = 0;
+
+        if (m_useInstancing)
+        {
+            XMFLOAT4X4* dst = reinterpret_cast<XMFLOAT4X4*>(m_mappedInstanceBuffer);
+            for (size_t i = 0; i < m_scatterVisible.size(); ++i)
+                dst[i] = m_scatterInstances[m_scatterVisible[i]].WorldT;
+
+            m_commandList->SetPipelineState(m_scatterInstancedPSO.Get());
+            m_commandList->SetGraphicsRootShaderResourceView(3, m_instanceBuffer->GetGPUVirtualAddress());
+
+            const UINT instanceCount = static_cast<UINT>(m_scatterVisible.size());
+            if (instanceCount > 0)
+            {
+                for (const DrawItem& di : m_drawItems)
+                {
+                    D3D12_GPU_DESCRIPTOR_HANDLE texHandle = textureHeapStart;
+                    texHandle.ptr += static_cast<UINT64>(di.TextureIndex) * m_srvDescriptorSize;
+                    m_commandList->SetGraphicsRootDescriptorTable(2, texHandle);
+                    m_commandList->DrawIndexedInstanced(di.IndexCount, instanceCount, di.StartIndexLocation, 0, 0);
+                    ++m_lastDrawCalls;
+                }
+            }
+        }
+        else
+        {
+            for (uint32_t idx : m_scatterVisible)
+            {
+                m_commandList->SetGraphicsRoot32BitConstants(1, 16, &m_scatterInstances[idx].WorldT, 0);
+
+                for (const DrawItem& di : m_drawItems)
+                {
+                    D3D12_GPU_DESCRIPTOR_HANDLE texHandle = textureHeapStart;
+                    texHandle.ptr += static_cast<UINT64>(di.TextureIndex) * m_srvDescriptorSize;
+                    m_commandList->SetGraphicsRootDescriptorTable(2, texHandle);
+
+                    m_commandList->DrawIndexedInstanced(di.IndexCount, 1, di.StartIndexLocation, 0, 0);
+                    ++m_lastDrawCalls;
+                }
+            }
+        }
+
+        D3D12_RESOURCE_BARRIER toPresent = toRT;
+        toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+        m_commandList->ResourceBarrier(1, &toPresent);
+
+        ThrowIfFailed(m_commandList->Close(), "Close list (scatter)");
+        ID3D12CommandList* lists[] = { m_commandList.Get() };
+        m_commandQueue->ExecuteCommandLists(1, lists);
+
+        ThrowIfFailed(m_swapChain->Present(0, 0), "Present (scatter)");
+        m_backBufferIndex = (m_backBufferIndex + 1) % SwapChainBufferCount;
+        FlushCommandQueue();
+        return;
+    }
+
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator");
     ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset command list");
 
@@ -876,12 +964,12 @@ void RenderingSystem::Draw(float dt)
     m_gBuffer->TransitionToWrite(m_commandList.Get());
     m_gBuffer->BindForGeometryPass(m_commandList.Get());
 
-    m_commandList->SetPipelineState(m_wireframe ? m_geometryWirePSO.Get() : m_geometryPSO.Get());
+    m_commandList->SetPipelineState(m_geometryPSO.Get());
     m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
 
     ID3D12DescriptorHeap* geometryHeaps[] = { m_textureHeap.Get() };
     m_commandList->SetDescriptorHeaps(1, geometryHeaps);
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
     m_commandList->IASetIndexBuffer(&m_indexBufferView);
 
@@ -889,20 +977,21 @@ void RenderingSystem::Draw(float dt)
     for (const DrawItem& drawItem : m_drawItems)
     {
         D3D12_GPU_DESCRIPTOR_HANDLE textureHandle = textureHeapStart;
-        textureHandle.ptr += static_cast<UINT64>(drawItem.DescriptorIndex) * m_srvDescriptorSize;
+        textureHandle.ptr += static_cast<UINT64>(drawItem.TextureIndex) * m_srvDescriptorSize;
 
         m_commandList->SetGraphicsRootDescriptorTable(1, textureHandle);
         m_commandList->SetGraphicsRoot32BitConstants(2, 8, &drawItem.Material, 0);
-        m_commandList->DrawIndexedInstanced(drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
+        m_commandList->DrawIndexedInstanced(
+            drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
     }
 
     m_gBuffer->TransitionToRead(m_commandList.Get());
 
     D3D12_RESOURCE_BARRIER toRenderTarget{};
     toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toRenderTarget.Transition.pResource = CurrentBackBuffer();
+    toRenderTarget.Transition.pResource   = CurrentBackBuffer();
     toRenderTarget.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    toRenderTarget.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toRenderTarget.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
     toRenderTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     m_commandList->ResourceBarrier(1, &toRenderTarget);
 
@@ -923,7 +1012,7 @@ void RenderingSystem::Draw(float dt)
 
     D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    toPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     m_commandList->ResourceBarrier(1, &toPresent);
 
     ThrowIfFailed(m_commandList->Close(), "Close command list");
@@ -1049,8 +1138,6 @@ bool RenderingSystem::BuildShaders()
     };
 
     compile("GeometryVS", "vs_5_0", m_geometryVS);
-    compile("GeometryHS", "hs_5_0", m_geometryHS);
-    compile("GeometryDS", "ds_5_0", m_geometryDS);
     compile("GeometryPS", "ps_5_0", m_geometryPS);
     compile("LightingVS", "vs_5_0", m_lightingVS);
     compile("LightingPS", "ps_5_0", m_lightingPS);
@@ -1063,18 +1150,12 @@ bool RenderingSystem::BuildShaders()
 
 bool RenderingSystem::BuildRootSignature()
 {
-    D3D12_DESCRIPTOR_RANGE textureRanges[2]{};
-    textureRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    textureRanges[0].NumDescriptors = 1;
-    textureRanges[0].BaseShaderRegister = 0;
-    textureRanges[0].RegisterSpace = 0;
-    textureRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-    textureRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    textureRanges[1].NumDescriptors = 2;
-    textureRanges[1].BaseShaderRegister = 4;
-    textureRanges[1].RegisterSpace = 0;
-    textureRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_DESCRIPTOR_RANGE textureRange{};
+    textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRange.NumDescriptors = 1;
+    textureRange.BaseShaderRegister = 0;
+    textureRange.RegisterSpace = 0;
+    textureRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
     D3D12_DESCRIPTOR_RANGE gbufferRange{};
     gbufferRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1091,9 +1172,9 @@ bool RenderingSystem::BuildRootSignature()
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 2;
-    params[1].DescriptorTable.pDescriptorRanges = textureRanges;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &textureRange;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[2].Constants.ShaderRegister = 2;
@@ -1124,7 +1205,7 @@ bool RenderingSystem::BuildRootSignature()
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderRegister = 0;
     sampler.RegisterSpace = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC desc{};
     desc.NumParameters = static_cast<UINT>(_countof(params));
@@ -1186,15 +1267,13 @@ bool RenderingSystem::BuildPSOs()
     D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryPso{};
     geometryPso.pRootSignature = m_rootSignature.Get();
     geometryPso.VS = { m_geometryVS->GetBufferPointer(), m_geometryVS->GetBufferSize() };
-    geometryPso.HS = { m_geometryHS->GetBufferPointer(), m_geometryHS->GetBufferSize() };
-    geometryPso.DS = { m_geometryDS->GetBufferPointer(), m_geometryDS->GetBufferSize() };
     geometryPso.PS = { m_geometryPS->GetBufferPointer(), m_geometryPS->GetBufferSize() };
     geometryPso.BlendState = blend;
     geometryPso.SampleMask = UINT_MAX;
     geometryPso.RasterizerState = rasterizer;
     geometryPso.DepthStencilState = geometryDepth;
     geometryPso.InputLayout = { m_inputLayout, static_cast<UINT>(_countof(m_inputLayout)) };
-    geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+    geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     geometryPso.NumRenderTargets = 3;
     geometryPso.RTVFormats[0] = m_gBuffer->GetAlbedoSpecFormat();
     geometryPso.RTVFormats[1] = m_gBuffer->GetNormalFormat();
@@ -1203,10 +1282,6 @@ bool RenderingSystem::BuildPSOs()
     geometryPso.SampleDesc.Count = 1;
     geometryPso.SampleDesc.Quality = 0;
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&geometryPso, IID_PPV_ARGS(&m_geometryPSO)), "Create geometry PSO");
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryWirePso = geometryPso;
-    geometryWirePso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
-    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&geometryWirePso, IID_PPV_ARGS(&m_geometryWirePSO)), "Create wireframe geometry PSO");
 
     D3D12_DEPTH_STENCIL_DESC lightingDepth{};
     lightingDepth.DepthEnable = FALSE;
@@ -1235,20 +1310,22 @@ bool RenderingSystem::BuildPSOs()
 bool RenderingSystem::BuildGeometry()
 {
     ObjMesh model{};
-    if (!LoadObj(ResolveAssetPath("models/cliff/namaqualand_cliff_02_4k.obj"), model))
-        throw std::runtime_error("Failed to load model.obj");
+    if (!LoadObj(ResolveAssetPath("models/gnome/gnome.obj"), model))
+        throw std::runtime_error("Failed to load gnome.obj");
+
+    m_meshBounds = AABB{};
+    for (const Vertex& v : model.vertices)
+        m_meshBounds.Expand(v.Pos);
 
     std::unordered_map<std::string, uint32_t> pathToIndex;
     std::vector<std::string> uniquePaths;
 
-    constexpr uint32_t kDefaultTextureCount = 3;
-
-    auto getTextureIndex = [&](const std::string& path, uint32_t fallback) -> uint32_t
+    auto getTextureIndex = [&](const std::string& path) -> uint32_t
     {
         if (path.empty())
-            return fallback;
+            return 0;
 
-        auto [it, inserted] = pathToIndex.emplace(path, static_cast<uint32_t>(uniquePaths.size()) + kDefaultTextureCount);
+        auto [it, inserted] = pathToIndex.emplace(path, static_cast<uint32_t>(uniquePaths.size()) + 1u);
         if (inserted)
             uniquePaths.push_back(path);
         return it->second;
@@ -1264,15 +1341,12 @@ bool RenderingSystem::BuildGeometry()
         DrawItem drawItem{};
         drawItem.StartIndexLocation = group.start;
         drawItem.IndexCount = group.count;
-        drawItem.DescriptorIndex = static_cast<uint32_t>(m_drawItems.size()) * 3u;
 
         const auto materialIt = model.materials.find(group.material);
         if (materialIt != model.materials.end())
         {
             const MtlData& material = materialIt->second;
-            drawItem.DiffuseTex = getTextureIndex(material.diffusePath, 0);
-            drawItem.NormalTex = getTextureIndex(material.normalPath, 1);
-            drawItem.DispTex = getTextureIndex(material.dispPath, 2);
+            drawItem.TextureIndex = getTextureIndex(material.diffusePath);
             drawItem.Material.BaseColor = XMFLOAT4(material.kd.x, material.kd.y, material.kd.z, 1.f);
             const float ksAverage = (material.ks.x + material.ks.y + material.ks.z) / 3.f;
             drawItem.Material.SurfaceParams.x = std::max(0.04f, ksAverage);
@@ -1340,30 +1414,16 @@ bool RenderingSystem::BuildGeometry()
         return texture;
     };
 
-    auto fixMissing = [&](uint32_t& texIndex, uint32_t fallback)
-    {
-        if (texIndex >= kDefaultTextureCount && !loaded[texIndex - kDefaultTextureCount])
-            texIndex = fallback;
-    };
-    for (DrawItem& item : m_drawItems)
-    {
-        fixMissing(item.DiffuseTex, 0);
-        fixMissing(item.NormalTex, 1);
-        fixMissing(item.DispTex, 2);
-    }
-
     m_textures.clear();
-    m_textures.resize(uniquePaths.size() + kDefaultTextureCount);
+    m_textures.resize(uniquePaths.size() + 1u);
     m_textures[0] = createTexture(1, 1, 1);
-    m_textures[1] = createTexture(1, 1, 1);
-    m_textures[2] = createTexture(1, 1, 1);
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            m_textures[i + kDefaultTextureCount] = createTexture(
+            m_textures[i + 1] = createTexture(
                 mipChains[i][0].width, mipChains[i][0].height, static_cast<uint16_t>(mipChains[i].size()));
         else
-            m_textures[i + kDefaultTextureCount] = m_textures[0];
+            m_textures[i + 1] = m_textures[0];
     }
 
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator for geometry upload");
@@ -1394,26 +1454,11 @@ bool RenderingSystem::BuildGeometry()
     whiteTexture[0].bgra = { 255, 255, 255, 255 };
     UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[0].Get(), whiteTexture, textureUploads);
 
-    std::vector<Image> flatNormalTexture(1);
-    flatNormalTexture[0].width = 1;
-    flatNormalTexture[0].height = 1;
-    flatNormalTexture[0].bgra = { 255, 128, 128, 255 };
-    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[1].Get(), flatNormalTexture, textureUploads);
-
-    std::vector<Image> flatHeightTexture(1);
-    flatHeightTexture[0].width = 1;
-    flatHeightTexture[0].height = 1;
-    flatHeightTexture[0].bgra = { 128, 128, 128, 255 };
-    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[2].Get(), flatHeightTexture, textureUploads);
-
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + kDefaultTextureCount].Get(), mipChains[i], textureUploads);
+            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + 1].Get(), mipChains[i], textureUploads);
     }
-
-    mipChains.clear();
-    mipChains.shrink_to_fit();
 
     ThrowIfFailed(m_commandList->Close(), "Close geometry upload command list");
     ID3D12CommandList* uploadLists[] = { m_commandList.Get() };
@@ -1429,25 +1474,21 @@ bool RenderingSystem::BuildGeometry()
     m_indexBufferView.Format = DXGI_FORMAT_R32_UINT;
 
     D3D12_DESCRIPTOR_HEAP_DESC textureHeapDesc{};
-    textureHeapDesc.NumDescriptors = std::max<UINT>(1u, static_cast<UINT>(m_drawItems.size()) * 3u);
+    textureHeapDesc.NumDescriptors = static_cast<UINT>(m_textures.size());
     textureHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     textureHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(m_device->CreateDescriptorHeap(&textureHeapDesc, IID_PPV_ARGS(&m_textureHeap)), "Create texture heap");
 
     D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
-    for (const DrawItem& item : m_drawItems)
+    for (size_t i = 0; i < m_textures.size(); ++i)
     {
-        const uint32_t texIndices[3] = { item.DiffuseTex, item.NormalTex, item.DispTex };
-        for (uint32_t texIndex : texIndices)
-        {
-            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Texture2D.MipLevels = static_cast<UINT>(-1);
-            m_device->CreateShaderResourceView(m_textures[texIndex].Get(), &srvDesc, srvHandle);
-            srvHandle.ptr += m_srvDescriptorSize;
-        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = static_cast<UINT>(-1);
+        m_device->CreateShaderResourceView(m_textures[i].Get(), &srvDesc, srvHandle);
+        srvHandle.ptr += m_srvDescriptorSize;
     }
 
     return true;
@@ -1500,10 +1541,6 @@ void RenderingSystem::UpdatePassConstants()
         1.f / static_cast<float>(m_width),
         1.f / static_cast<float>(m_height));
 
-    if (!m_displacementEnabled)
-        constants.DispParams.x = 0.f;
-    constants.DispParams.z = m_normalMapEnabled ? 1.f : 0.f;
-
     std::memcpy(m_mappedPassConstants, &constants, sizeof(constants));
 }
 
@@ -1515,7 +1552,7 @@ void RenderingSystem::UpdateLightConstants(float dt)
     m_time += dt;
 
     LightConstants constants{};
-    constants.AmbientColor = XMFLOAT4(0.12f, 0.12f, 0.14f, 1.f);
+    constants.AmbientColor = XMFLOAT4(0.25f, 0.25f, 0.28f, 1.f);
 
     const uint32_t lightCount = static_cast<uint32_t>(std::min<size_t>(m_sceneLights.size(), MaxLights));
     constants.LightCount = XMFLOAT4(static_cast<float>(lightCount), 0.f, 0.f, 0.f);
@@ -1524,13 +1561,6 @@ void RenderingSystem::UpdateLightConstants(float dt)
     {
         GpuLight light = m_sceneLights[i];
         const float type = light.Params.x;
-
-        if (i == m_orbitingLightIndex)
-        {
-            light.PositionRange.x = -0.5f + 7.f * std::cos(m_time * 0.5f);
-            light.PositionRange.y = 3.5f + 2.f * std::sin(m_time * 0.8f);
-        }
-
         if (type > 0.5f)
         {
             const float pulse = 0.9f + 0.1f * std::sin(m_time * 1.35f + static_cast<float>(i) * 0.75f);
@@ -1574,8 +1604,6 @@ void RenderingSystem::CreateSceneLights()
     {
         GpuLight light{};
         const XMFLOAT3 dir = normalize(direction);
-        outerAngleDeg = std::clamp(outerAngleDeg, 1.f, 80.f);
-        innerAngleDeg = std::clamp(innerAngleDeg, 0.f, outerAngleDeg);
         const float innerAngle = XMConvertToRadians(innerAngleDeg);
         const float outerAngle = XMConvertToRadians(outerAngleDeg);
 
@@ -1588,13 +1616,7 @@ void RenderingSystem::CreateSceneLights()
 
     m_sceneLights.clear();
 
-    m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.6f, -0.5f, -0.6f), XMFLOAT3(1.0f, 0.95f, 0.85f), 1.1f));
-
-    m_orbitingLightIndex = static_cast<uint32_t>(m_sceneLights.size());
-    m_sceneLights.push_back(makePoint(XMFLOAT3(0.f, 3.5f, 3.5f), XMFLOAT3(1.0f, 0.6f, 0.3f), 2.5f, 9.f));
-
-    m_sceneLights.push_back(makeSpot(XMFLOAT3(-6.f, 0.5f, 6.f), XMFLOAT3(0.5f, 0.35f, -1.f),
-        XMFLOAT3(0.4f, 0.6f, 1.0f), 3.f, 16.f, 15.f, 30.f));
+    m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.4f, -1.f, 0.3f), XMFLOAT3(1.f, 0.97f, 0.9f), 1.f));
 }
 
 void RenderingSystem::FlushCommandQueue()
@@ -1606,6 +1628,278 @@ void RenderingSystem::FlushCommandQueue()
         ThrowIfFailed(m_fence->SetEventOnCompletion(value, m_fenceEvent), "Set fence event");
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
+}
+
+void RenderingSystem::ToggleSceneMode()
+{
+    m_sceneMode = (m_sceneMode + 1) % 2;
+}
+
+void RenderingSystem::ToggleInstancing()
+{
+    m_useInstancing = !m_useInstancing;
+}
+
+void RenderingSystem::ToggleFrustumCulling()
+{
+    m_useFrustumCulling = !m_useFrustumCulling;
+    if (m_useFrustumCulling)
+        m_useOctreeCulling = false;
+}
+
+void RenderingSystem::ToggleOctreeCulling()
+{
+    m_useOctreeCulling = !m_useOctreeCulling;
+    if (m_useOctreeCulling)
+        m_useFrustumCulling = false;
+}
+
+bool RenderingSystem::BuildScatterResources()
+{
+    if (m_drawItems.empty())
+        return false;
+
+    m_scatterInstances.clear();
+    m_scatterInstances.reserve(kScatterInstanceCount);
+
+    const float spacing = 2.0f;
+    const float half = (kScatterGridSide - 1) * 0.5f * spacing;
+    const AABB localBounds = m_meshBounds;
+
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> jitter(-0.6f, 0.6f);
+    std::uniform_real_distribution<float> angle(0.f, XM_2PI);
+    std::uniform_real_distribution<float> scale(0.8f, 1.4f);
+
+    for (uint32_t z = 0; z < kScatterGridSide; ++z)
+    {
+        for (uint32_t x = 0; x < kScatterGridSide; ++x)
+        {
+            const float px = x * spacing - half + jitter(rng);
+            const float pz = z * spacing - half + jitter(rng);
+            const float s  = scale(rng);
+
+            ScatterInstance inst{};
+            const XMMATRIX world = XMMatrixScaling(s, s, s)
+                                 * XMMatrixRotationY(angle(rng))
+                                 * XMMatrixTranslation(px, 0.f, pz);
+            XMStoreFloat4x4(&inst.World, world);
+            XMStoreFloat4x4(&inst.WorldT, XMMatrixTranspose(world));
+            inst.WorldBounds = TransformAABB(localBounds, inst.World);
+            m_scatterInstances.push_back(inst);
+        }
+    }
+
+    std::vector<AABB> worldBounds;
+    worldBounds.reserve(m_scatterInstances.size());
+    for (const auto& inst : m_scatterInstances)
+        worldBounds.push_back(inst.WorldBounds);
+
+    AABB sceneBounds = worldBounds[0];
+    for (const auto& b : worldBounds)
+    {
+        sceneBounds.Min.x = std::min(sceneBounds.Min.x, b.Min.x);
+        sceneBounds.Min.y = std::min(sceneBounds.Min.y, b.Min.y);
+        sceneBounds.Min.z = std::min(sceneBounds.Min.z, b.Min.z);
+        sceneBounds.Max.x = std::max(sceneBounds.Max.x, b.Max.x);
+        sceneBounds.Max.y = std::max(sceneBounds.Max.y, b.Max.y);
+        sceneBounds.Max.z = std::max(sceneBounds.Max.z, b.Max.z);
+    }
+    sceneBounds.Min.x -= 1.f; sceneBounds.Min.y -= 1.f; sceneBounds.Min.z -= 1.f;
+    sceneBounds.Max.x += 1.f; sceneBounds.Max.y += 1.f; sceneBounds.Max.z += 1.f;
+
+    m_scatterOctree.Build(worldBounds, sceneBounds, 6, 8);
+    m_scatterOctreeBuilt = true;
+
+    {
+        UINT flags = 0;
+#if defined(_DEBUG)
+        flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+        ComPtr<ID3DBlob> errors;
+        const std::wstring sp = ToWide(ResolveAssetPath("shaders/ScatterScene.hlsl"));
+
+        auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob)
+        {
+            errors.Reset();
+            HRESULT hr = D3DCompileFromFile(sp.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                entry, target, flags, 0, &blob, &errors);
+            if (FAILED(hr))
+            {
+                if (errors) throw std::runtime_error((const char*)errors->GetBufferPointer());
+                ThrowIfFailed(hr, entry);
+            }
+        };
+        compile("VS", "vs_5_0", m_scatterVS);
+        compile("VSInstanced", "vs_5_0", m_scatterInstancedVS);
+        compile("PS", "ps_5_0", m_scatterPS);
+    }
+
+    {
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.RegisterSpace = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER params[4]{};
+
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].Descriptor.RegisterSpace = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.ShaderRegister = 1;
+        params[1].Constants.RegisterSpace = 0;
+        params[1].Constants.Num32BitValues = 16;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable.NumDescriptorRanges = 1;
+        params[2].DescriptorTable.pDescriptorRanges = &srvRange;
+        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[3].Descriptor.ShaderRegister = 1;
+        params[3].Descriptor.RegisterSpace = 0;
+        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+        D3D12_STATIC_SAMPLER_DESC samp{};
+        samp.Filter = D3D12_FILTER_ANISOTROPIC;
+        samp.MaxAnisotropy = 8;
+        samp.MinLOD = 0.f;
+        samp.MaxLOD = D3D12_FLOAT32_MAX;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samp.MipLODBias = 0.f;
+        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samp.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        samp.ShaderRegister = 0;
+        samp.RegisterSpace = 0;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC desc{};
+        desc.NumParameters = static_cast<UINT>(_countof(params));
+        desc.pParameters = params;
+        desc.NumStaticSamplers = 1;
+        desc.pStaticSamplers = &samp;
+        desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> serialized, err;
+        HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &err);
+        if (FAILED(hr))
+        {
+            if (err) throw std::runtime_error((const char*)err->GetBufferPointer());
+            ThrowIfFailed(hr, "SerializeScatterRS");
+        }
+        ThrowIfFailed(m_device->CreateRootSignature(0, serialized->GetBufferPointer(),
+            serialized->GetBufferSize(), IID_PPV_ARGS(&m_scatterRootSig)), "ScatterRS");
+    }
+
+    {
+        D3D12_RASTERIZER_DESC rast{};
+        rast.FillMode = D3D12_FILL_MODE_SOLID;
+        rast.CullMode = D3D12_CULL_MODE_BACK;
+        rast.FrontCounterClockwise = FALSE;
+        rast.DepthClipEnable = TRUE;
+
+        D3D12_BLEND_DESC blend{};
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable = TRUE;
+        ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+        pso.pRootSignature = m_scatterRootSig.Get();
+        pso.VS = { m_scatterVS->GetBufferPointer(), m_scatterVS->GetBufferSize() };
+        pso.PS = { m_scatterPS->GetBufferPointer(), m_scatterPS->GetBufferSize() };
+        pso.BlendState = blend;
+        pso.SampleMask = UINT_MAX;
+        pso.RasterizerState = rast;
+        pso.DepthStencilState = ds;
+        pso.InputLayout = { m_inputLayout, 3 };
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 1;
+        pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
+        pso.SampleDesc.Count = 1;
+
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_scatterPSO)), "ScatterPSO");
+
+        pso.VS = { m_scatterInstancedVS->GetBufferPointer(), m_scatterInstancedVS->GetBufferSize() };
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_scatterInstancedPSO)), "ScatterInstancedPSO");
+    }
+
+    {
+        auto upHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        struct ScatterViewCB { XMFLOAT4X4 ViewProj; XMFLOAT4 Eye; XMFLOAT4 LightDir; };
+        const uint32_t sz = AlignConstantBufferSize(sizeof(ScatterViewCB));
+        const auto desc = BufferDesc(sz);
+        ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_scatterViewCB)), "ScatterViewCB");
+        D3D12_RANGE rr{0,0};
+        ThrowIfFailed(m_scatterViewCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedScatterViewCB)), "Map ScatterViewCB");
+
+        const auto instDesc = BufferDesc(static_cast<UINT64>(kScatterInstanceCount) * sizeof(XMFLOAT4X4));
+        ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &instDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_instanceBuffer)), "InstanceBuffer");
+        ThrowIfFailed(m_instanceBuffer->Map(0, &rr, reinterpret_cast<void**>(&m_mappedInstanceBuffer)), "Map InstanceBuffer");
+    }
+
+    return true;
+}
+
+void RenderingSystem::UpdateScatterVisible()
+{
+    struct ScatterViewCB { XMFLOAT4X4 ViewProj; XMFLOAT4 Eye; XMFLOAT4 LightDir; };
+    ScatterViewCB cb{};
+    const XMMATRIX vp = XMLoadFloat4x4(&m_view) * XMLoadFloat4x4(&m_proj);
+    XMStoreFloat4x4(&cb.ViewProj, XMMatrixTranspose(vp));
+    cb.Eye = { m_eyePos.x, m_eyePos.y, m_eyePos.z, 1.f };
+    cb.LightDir = { 0.4f, -1.f, 0.3f, 0.f };
+    std::memcpy(m_mappedScatterViewCB, &cb, sizeof(cb));
+
+    LARGE_INTEGER freq{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    auto finishTiming = [&]()
+    {
+        QueryPerformanceCounter(&t1);
+        m_lastCullMicroseconds = static_cast<float>(
+            static_cast<double>(t1.QuadPart - t0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart));
+    };
+
+    if (!m_useFrustumCulling && !m_useOctreeCulling)
+    {
+        m_scatterVisible.clear();
+        for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
+            m_scatterVisible.push_back(i);
+        m_lastAabbTests = 0;
+        finishTiming();
+        return;
+    }
+
+    XMFLOAT4X4 vpCpu;
+    XMStoreFloat4x4(&vpCpu, vp);
+    const Frustum f = Frustum::FromViewProj(vpCpu);
+
+    if (m_useOctreeCulling && m_scatterOctreeBuilt)
+    {
+        m_lastAabbTests = m_scatterOctree.QueryVisible(f, m_scatterVisible);
+    }
+    else
+    {
+        m_scatterVisible.clear();
+        for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
+            if (f.Intersects(m_scatterInstances[i].WorldBounds))
+                m_scatterVisible.push_back(i);
+        m_lastAabbTests = static_cast<uint32_t>(m_scatterInstances.size());
+    }
+
+    finishTiming();
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::CurrentBackBufferRTV() const

@@ -5,8 +5,6 @@ cbuffer PassCB : register(b0)
     float4x4 gInvViewProj;
     float4   gEyePosW;
     float4   gRTSize;
-    float4   gTessParams;
-    float4   gDispParams;
 };
 
 cbuffer MaterialCB : register(b2)
@@ -16,21 +14,12 @@ cbuffer MaterialCB : register(b2)
 };
 
 Texture2D    gDiffuseMap : register(t0);
-Texture2D    gNormalMap  : register(t4);
-Texture2D    gDispMap    : register(t5);
 SamplerState gSampler    : register(s0);
 
 struct VSIn
 {
     float3 PosL    : POSITION;
     float3 NormalL : NORMAL;
-    float2 TexC    : TEXCOORD;
-};
-
-struct VSOut
-{
-    float3 PosW    : POSITION;
-    float3 NormalW : NORMAL;
     float2 TexC    : TEXCOORD;
 };
 
@@ -42,69 +31,15 @@ struct GeoVSOut
     float2 TexC    : TEXCOORD;
 };
 
-VSOut GeometryVS(VSIn vin)
+GeoVSOut GeometryVS(VSIn vin)
 {
-    VSOut vout;
-    vout.PosW    = mul(float4(vin.PosL, 1.f), gWorld).xyz;
+    GeoVSOut vout;
+    float4 posW  = mul(float4(vin.PosL, 1.f), gWorld);
+    vout.PosW    = posW.xyz;
     vout.NormalW = mul(vin.NormalL, (float3x3)gWorld);
+    vout.PosH    = mul(posW, gViewProj);
     vout.TexC    = vin.TexC;
     return vout;
-}
-
-float CalcTessFactor(float3 posW)
-{
-    float d = distance(posW, gEyePosW.xyz);
-    float s = saturate((gTessParams.y - d) / max(gTessParams.y - gTessParams.x, 1e-4f));
-    return lerp(gTessParams.z, gTessParams.w, s);
-}
-
-struct PatchTess
-{
-    float EdgeTess[3] : SV_TessFactor;
-    float InsideTess  : SV_InsideTessFactor;
-};
-
-PatchTess PatchConstantHS(InputPatch<VSOut, 3> patch)
-{
-    PatchTess pt;
-
-    pt.EdgeTess[0] = CalcTessFactor(0.5f * (patch[1].PosW + patch[2].PosW));
-    pt.EdgeTess[1] = CalcTessFactor(0.5f * (patch[2].PosW + patch[0].PosW));
-    pt.EdgeTess[2] = CalcTessFactor(0.5f * (patch[0].PosW + patch[1].PosW));
-
-    pt.InsideTess = (pt.EdgeTess[0] + pt.EdgeTess[1] + pt.EdgeTess[2]) / 3.f;
-    return pt;
-}
-
-[domain("tri")]
-[partitioning("fractional_odd")]
-[outputtopology("triangle_cw")]
-[outputcontrolpoints(3)]
-[patchconstantfunc("PatchConstantHS")]
-[maxtessfactor(64.0f)]
-VSOut GeometryHS(InputPatch<VSOut, 3> patch, uint i : SV_OutputControlPointID)
-{
-    return patch[i];
-}
-
-[domain("tri")]
-GeoVSOut GeometryDS(PatchTess patchTess, float3 bary : SV_DomainLocation, const OutputPatch<VSOut, 3> tri)
-{
-    GeoVSOut dout;
-
-    float3 posW    = bary.x * tri[0].PosW    + bary.y * tri[1].PosW    + bary.z * tri[2].PosW;
-    float3 normalW = normalize(bary.x * tri[0].NormalW + bary.y * tri[1].NormalW + bary.z * tri[2].NormalW);
-    float2 uv      = bary.x * tri[0].TexC    + bary.y * tri[1].TexC    + bary.z * tri[2].TexC;
-
-    float height = gDispMap.SampleLevel(gSampler, uv, 0.f).r;
-
-    posW += normalW * ((height - gDispParams.y) * gDispParams.x);
-
-    dout.PosW    = posW;
-    dout.NormalW = normalW;
-    dout.TexC    = uv;
-    dout.PosH    = mul(float4(posW, 1.f), gViewProj);
-    return dout;
 }
 
 struct GBufferOut
@@ -114,26 +49,6 @@ struct GBufferOut
     float  Depth      : SV_Target2;
 };
 
-float3 ApplyNormalMap(float3 N, float3 posW, float2 uv)
-{
-    float3 nTS = gNormalMap.Sample(gSampler, uv).xyz * 2.f - 1.f;
-
-    float3 dp1  = ddx(posW);
-    float3 dp2  = ddy(posW);
-    float2 duv1 = ddx(uv);
-    float2 duv2 = ddy(uv);
-
-    float3 dp2perp = cross(dp2, N);
-    float3 dp1perp = cross(N, dp1);
-    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-
-    float invMax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20f));
-    float3x3 TBN = float3x3(T * invMax, B * invMax, N);
-
-    return normalize(mul(nTS, TBN));
-}
-
 GBufferOut GeometryPS(GeoVSOut pin)
 {
     GBufferOut gout;
@@ -142,12 +57,8 @@ GBufferOut GeometryPS(GeoVSOut pin)
     float  specInt = gSurfaceParams.x;
     float  shiny   = gSurfaceParams.y;
 
-    float3 N = normalize(pin.NormalW);
-    if (gDispParams.z > 0.5f)
-        N = ApplyNormalMap(N, pin.PosW, pin.TexC);
-
     gout.AlbedoSpec = float4(albedo, specInt);
-    gout.Normal     = float4(N, shiny);
+    gout.Normal     = float4(normalize(pin.NormalW), shiny);
     gout.Depth      = pin.PosH.z;
     return gout;
 }
