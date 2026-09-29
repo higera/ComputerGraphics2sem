@@ -36,8 +36,10 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+    void ToggleWireframe() { m_wireframe = !m_wireframe; }
 
-    void ToggleLightType(uint32_t type);
+    void ToggleDisplacement() { m_displacementEnabled = !m_displacementEnabled; }
+    void ToggleNormalMap() { m_normalMapEnabled = !m_normalMapEnabled; }
 
 private:
     struct MaterialConstants
@@ -50,7 +52,10 @@ private:
     {
         uint32_t IndexCount = 0;
         uint32_t StartIndexLocation = 0;
-        uint32_t TextureIndex = 0;
+        uint32_t DiffuseTex = 0;
+        uint32_t NormalTex = 1;
+        uint32_t DispTex = 2;
+        uint32_t DescriptorIndex = 0;
         MaterialConstants Material;
     };
 
@@ -61,6 +66,8 @@ private:
         DirectX::XMFLOAT4X4 InvViewProj{};
         DirectX::XMFLOAT4 EyePosW{ 0.f, 0.f, 0.f, 1.f };
         DirectX::XMFLOAT4 RenderTargetSize{ 1.f, 1.f, 1.f, 1.f };
+        DirectX::XMFLOAT4 TessParams{ 3.f, 25.f, 1.f, 6.f };
+        DirectX::XMFLOAT4 DispParams{ 0.10f, 0.5f, 0.f, 0.f };
     };
 
     struct alignas(16) GpuLight
@@ -71,22 +78,13 @@ private:
         DirectX::XMFLOAT4 Params{};
     };
 
-    enum LightType : uint32_t { LightDirectional = 0, LightPoint = 1, LightSpot = 2 };
+    static constexpr uint32_t MaxLights = 32;
 
-    static constexpr uint32_t MaxLights = 4096;
-
-    struct LightPassConstants
+    struct alignas(16) LightConstants
     {
-        DirectX::XMFLOAT4 AmbientColor{ 0.055f, 0.055f, 0.06f, 1.f };
-        uint32_t LightOffset = 0;
-        uint32_t Pad[3]{};
-    };
-
-    struct VolumeMesh
-    {
-        uint32_t IndexCount = 0;
-        uint32_t StartIndex = 0;
-        int32_t BaseVertex = 0;
+        DirectX::XMFLOAT4 AmbientColor{ 0.05f, 0.05f, 0.06f, 1.f };
+        DirectX::XMFLOAT4 LightCount{ 0.f, 0.f, 0.f, 0.f };
+        GpuLight Lights[MaxLights]{};
     };
 
 private:
@@ -101,10 +99,9 @@ private:
     bool BuildPSOs();
     bool BuildGeometry();
     bool BuildFrameResources();
-    bool BuildLightVolumes();
 
     void UpdatePassConstants();
-    void UpdateLights(float dt);
+    void UpdateLightConstants(float dt);
     void CreateSceneLights();
 
     void FlushCommandQueue();
@@ -147,20 +144,20 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_ambientPSO;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_directionalPSO;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightVolumePSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryWirePSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
+    bool m_wireframe = false;
+    bool m_displacementEnabled = true;
+    bool m_normalMapEnabled = true;
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryHS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryDS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_fullscreenVS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_ambientPS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_directionalPS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_lightVolumeVS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_lightVolumePS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_lightingVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
-    D3D12_INPUT_ELEMENT_DESC m_volumeInputLayout[1]{};
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vertexBuffer;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_indexBuffer;
@@ -171,23 +168,12 @@ private:
     std::vector<DrawItem> m_drawItems;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_passConstantBuffer;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightConstantBuffer;
     uint8_t* m_mappedPassConstants = nullptr;
-    GpuLight* m_mappedLights = nullptr;
-
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_volumeVertexBuffer;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_volumeIndexBuffer;
-    D3D12_VERTEX_BUFFER_VIEW m_volumeVBView{};
-    D3D12_INDEX_BUFFER_VIEW m_volumeIBView{};
-    VolumeMesh m_sphereMesh;
-    VolumeMesh m_coneMesh;
+    uint8_t* m_mappedLightConstants = nullptr;
 
     std::vector<GpuLight> m_sceneLights;
-    bool m_lightTypeEnabled[3]{ true, true, true };
-    LightPassConstants m_lightPass;
-    uint32_t m_directionalCount = 0;
-    uint32_t m_pointCount = 0;
-    uint32_t m_spotCount = 0;
+    uint32_t m_orbitingLightIndex = UINT32_MAX;
 
     DirectX::XMFLOAT4X4 m_world{};
     DirectX::XMFLOAT4X4 m_view{};

@@ -25,7 +25,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
     m_input = std::make_unique<Input>();
     m_input->Reset();
 
-    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-2: Deferred Rendering"))
+    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-3: Tessellation + Displacement + Normal Maps"))
         return false;
 
     m_dx12 = std::make_unique<D3D12Context>();
@@ -132,9 +132,13 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         return 0;
 
     case WM_KEYDOWN:
-        if (wparam >= '1' && wparam <= '3' && !(lparam & (1 << 30)) && m_dx12)
-            m_dx12->ToggleLightType((uint32_t)(wparam - '1'));
         if (m_input) m_input->OnKeyDown((uint32_t)wparam);
+        if (!(lparam & (1 << 30)) && m_dx12)
+        {
+            if (wparam == 'F') m_dx12->ToggleWireframe();
+            if (wparam == 'H') m_dx12->ToggleDisplacement();
+            if (wparam == 'N') m_dx12->ToggleNormalMap();
+        }
         return 0;
 
     case WM_KEYUP: if (m_input) m_input->OnKeyUp((uint32_t)wparam); return 0;

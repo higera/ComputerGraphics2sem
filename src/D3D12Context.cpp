@@ -37,8 +37,20 @@ void D3D12Context::SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float p
         m_renderer->SetCamera(eyePos, yaw, pitch);
 }
 
-void D3D12Context::ToggleLightType(uint32_t type)
+void D3D12Context::ToggleWireframe()
 {
     if (m_renderer)
-        m_renderer->ToggleLightType(type);
+        m_renderer->ToggleWireframe();
+}
+
+void D3D12Context::ToggleDisplacement()
+{
+    if (m_renderer)
+        m_renderer->ToggleDisplacement();
+}
+
+void D3D12Context::ToggleNormalMap()
+{
+    if (m_renderer)
+        m_renderer->ToggleNormalMap();
 }
