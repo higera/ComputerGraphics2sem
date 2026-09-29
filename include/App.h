@@ -34,6 +34,11 @@ private:
     float m_camPitch = -0.2f;
     DirectX::XMFLOAT3 m_camPos{ -4.f, 2.f, 0.f };
 
+    bool m_vignetteOn = true;
+    bool m_chromaOn = true;
+    bool m_toneMapOn = true;
+    int  m_debugView = 0;
+
     float m_fpsTimer = 0.f;
     uint32_t m_fpsFrames = 0;
     float m_fps = 0.f;

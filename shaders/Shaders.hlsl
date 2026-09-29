@@ -308,5 +308,5 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
         finalColor *= kCascadeColors[GetCascadeIndex(viewZ)];
     }
 
-    return float4(pow(saturate(finalColor), 1.f / 2.2f), 1.f);
+    return float4(finalColor, 1.f);
 }

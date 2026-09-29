@@ -55,6 +55,8 @@ public:
     DirectX::XMFLOAT4 GetCascadeSplits() const;
     uint32_t ShadowDrawCalls() const { return m_shadowDrawCalls; }
 
+    void SetPostEffects(bool vignette, bool chroma, bool toneMapping, int debugView);
+
     void ToggleEmitter();
     void TogglePauseParticles();
     void ScaleEmitRate(float factor);
@@ -77,6 +79,16 @@ private:
         uint32_t TextureIndex = 0;
         MaterialConstants Material;
         AABB WorldBounds;
+    };
+
+    struct alignas(16) PostConstants
+    {
+        DirectX::XMFLOAT4 RenderTargetSize{ 1.f, 1.f, 1.f, 1.f };
+        DirectX::XMFLOAT4 Vignette{ 0.75f, 0.35f, 0.f, 0.f };
+        DirectX::XMFLOAT4 Chroma{ 0.006f, 0.f, 0.f, 0.f };
+        DirectX::XMFLOAT4 Flags{ 1.f, 1.f, 1.f, 0.f };
+        DirectX::XMFLOAT4 ToneParams{ 1.f, 0.f, 0.f, 0.f };
+        DirectX::XMFLOAT4 DepthParams{ 0.05f, 200.f, 40.f, 0.f };
     };
 
     struct alignas(16) PassConstants
@@ -124,6 +136,9 @@ private:
 
     void FlushCommandQueue();
 
+    bool BuildPostRootSignature();
+    void CreateSceneColor();
+
     D3D12_CPU_DESCRIPTOR_HANDLE CurrentBackBufferRTV() const;
     ID3D12Resource* CurrentBackBuffer() const;
 
@@ -134,6 +149,9 @@ private:
     static constexpr float kNearZ = 0.05f;
     static constexpr float kFarZ = 200.f;
     static constexpr float kShadowDistance = 60.f;
+
+    static constexpr DXGI_FORMAT kSceneColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    static constexpr float kSceneClearColor[4] = { 0.f, 0.f, 0.f, 1.f };
 
     bool m_initialized = false;
     HWND m_hwnd = nullptr;
@@ -183,6 +201,16 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_particleGS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_particlePS;
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_postRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_postPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_postVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_postPS;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_sceneColor;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_sceneRtvHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_postConstantBuffer;
+    uint8_t* m_mappedPostConstants = nullptr;
+    PostConstants m_post;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
 

@@ -61,3 +61,9 @@ bool D3D12Context::EmitterOn() const             { return m_renderer ? m_rendere
 bool D3D12Context::ParticlesPaused() const       { return m_renderer ? m_renderer->ParticlesPaused() : false; }
 float D3D12Context::EmitRate() const             { return m_renderer ? m_renderer->EmitRate() : 0.f; }
 uint32_t D3D12Context::AliveParticles() const    { return m_renderer ? m_renderer->AliveParticles() : 0; }
+
+void D3D12Context::SetPostEffects(bool vignette, bool chroma, bool toneMapping, int debugView)
+{
+    if (m_renderer)
+        m_renderer->SetPostEffects(vignette, chroma, toneMapping, debugView);
+}

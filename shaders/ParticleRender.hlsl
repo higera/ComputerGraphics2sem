@@ -73,5 +73,5 @@ float4 ParticlePS(GSOut pin) : SV_Target
     clip(1.0f - r2);
 
     float shade = 1.0f - 0.35f * r2;
-    return float4(pin.Color * shade, 1.0f);
+    return float4(pow(pin.Color * shade, 2.2f), 1.0f);
 }

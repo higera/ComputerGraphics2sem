@@ -31,6 +31,8 @@ public:
     DirectX::XMFLOAT4 GetCascadeSplits() const;
     uint32_t ShadowDrawCalls() const;
 
+    void SetPostEffects(bool vignette, bool chroma, bool toneMapping, int debugView);
+
     void ToggleEmitter();
     void TogglePauseParticles();
     void ScaleEmitRate(float factor);

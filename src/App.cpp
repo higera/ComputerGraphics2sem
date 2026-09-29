@@ -26,7 +26,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
     m_input = std::make_unique<Input>();
     m_input->Reset();
 
-    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-6: GPU Particles"))
+    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-7: Post-processing"))
         return false;
 
     m_dx12 = std::make_unique<D3D12Context>();
@@ -146,14 +146,18 @@ void App::UpdateWindowTitle(float dt)
     m_fpsTimer = 0.f;
     m_fpsFrames = 0;
 
+    static const wchar_t* kDebugNames[] = { L"off", L"albedo", L"normals", L"depth" };
+
     wchar_t buf[256];
     swprintf(buf, 256,
-        L"Lab-6 Particles | FPS %.0f | Alive %u / 65536 | R: emitter %ls | [ ]: rate %.0f/s | Space: %ls | "
-        L"C/P/L/K: CSM",
-        m_fps, m_dx12->AliveParticles(),
-        m_dx12->EmitterOn() ? L"ON" : L"OFF",
-        m_dx12->EmitRate(),
-        m_dx12->ParticlesPaused() ? L"PAUSED" : L"running");
+        L"Lab-7 Post | FPS %.0f | F1 vignette %ls | F2 chroma %ls | F3 G-buffer: %ls | F4 tonemap %ls | "
+        L"particles %u",
+        m_fps,
+        m_vignetteOn ? L"ON" : L"OFF",
+        m_chromaOn ? L"ON" : L"OFF",
+        kDebugNames[m_debugView],
+        m_toneMapOn ? L"ACES" : L"OFF",
+        m_dx12->AliveParticles());
     SetWindowTextW(m_window->GetHwnd(), buf);
 }
 
@@ -175,6 +179,12 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             if (wparam == 'P') m_dx12->TogglePcf();
             if (wparam == 'K') m_dx12->ToggleShadowCulling();
             if (wparam == 'L') m_dx12->CycleSplitLambda();
+
+            if (wparam == VK_F1) m_vignetteOn = !m_vignetteOn;
+            if (wparam == VK_F2) m_chromaOn = !m_chromaOn;
+            if (wparam == VK_F3) m_debugView = (m_debugView + 1) % 4;
+            if (wparam == VK_F4) m_toneMapOn = !m_toneMapOn;
+            m_dx12->SetPostEffects(m_vignetteOn, m_chromaOn, m_toneMapOn, m_debugView);
 
             if (wparam == 'R')        m_dx12->ToggleEmitter();
             if (wparam == VK_SPACE)   m_dx12->TogglePauseParticles();

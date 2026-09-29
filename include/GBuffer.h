@@ -28,6 +28,13 @@ public:
         return h;
     }
 
+    D3D12_CPU_DESCRIPTOR_HANDLE GetSceneColorSrvCpu() const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(TargetCount + 1) * m_srvDescriptorSize;
+        return h;
+    }
+
     DXGI_FORMAT GetAlbedoSpecFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
     DXGI_FORMAT GetNormalFormat() const { return DXGI_FORMAT_R16G16B16A16_FLOAT; }
     DXGI_FORMAT GetDepthValueFormat() const { return DXGI_FORMAT_R32_FLOAT; }
