@@ -12,6 +12,8 @@ add_executable(dx12_textures
         src/Window.cpp
         src/Input.cpp
         src/D3D12Context.cpp
+        src/GBuffer.cpp
+        src/RenderingSystem.cpp
 )
 
 # 2. Заголовки (.h) — ищем в папке include
@@ -20,8 +22,8 @@ target_include_directories(dx12_textures PRIVATE include)
 # 3. Макросы Windows
 target_compile_definitions(dx12_textures PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
-# 4. Исходники сохранены в UTF-8 (русские комментарии и строки).
-#    Без /utf-8 MSVC на русской Windows читает их как CP1251, и строка L"Ошибка" превращается в мусор.
+# 4. Исходники в UTF-8 (русские комментарии и строки).
+#    Без /utf-8 MSVC на русской Windows читает их как CP1251, и L"Ошибка" превращается в мусор.
 if (MSVC)
     target_compile_options(dx12_textures PRIVATE /utf-8)
 endif()
@@ -50,7 +52,7 @@ target_link_libraries(dx12_textures PRIVATE
 )
 
 # 7. Рабочая папка при запуске из Visual Studio = корень проекта (там лежат shaders/ и sponza/).
-#    В CLion то же самое: Run/Debug Configurations -> Working directory = $ProjectFileDir$
+#    В CLion: Run/Debug Configurations -> Working directory = $ProjectFileDir$
 #    (впрочем, ResolveAssetPath и так ищет файлы в ../ и ../../).
 set_target_properties(dx12_textures PROPERTIES
         VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

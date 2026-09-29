@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <memory>
+#include <DirectXMath.h>
 #include "D3D12Context.h"
 
 class Window;
