@@ -26,7 +26,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
     m_input = std::make_unique<Input>();
     m_input->Reset();
 
-    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-4"))
+    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-5: Cascaded Shadow Maps"))
         return false;
 
     m_dx12 = std::make_unique<D3D12Context>();
@@ -76,6 +76,16 @@ void App::Update(float dt)
         m_exitRequested = true;
 
     if (!m_input || !m_dx12 || !m_window) return;
+
+    const float sunTurnSpeed = 1.0f;
+    float sunAzimuth = 0.f;
+    float sunHeight = 0.f;
+    if (m_input->IsKeyDown(VK_LEFT))  sunAzimuth -= sunTurnSpeed * dt;
+    if (m_input->IsKeyDown(VK_RIGHT)) sunAzimuth += sunTurnSpeed * dt;
+    if (m_input->IsKeyDown(VK_UP))    sunHeight  += sunTurnSpeed * dt;
+    if (m_input->IsKeyDown(VK_DOWN))  sunHeight  -= sunTurnSpeed * dt;
+    if (sunAzimuth != 0.f || sunHeight != 0.f)
+        m_dx12->RotateSun(sunAzimuth, sunHeight);
 
     if (m_input->IsKeyDown(VK_RBUTTON))
     {
@@ -136,23 +146,16 @@ void App::UpdateWindowTitle(float dt)
     m_fpsTimer = 0.f;
     m_fpsFrames = 0;
 
+    const DirectX::XMFLOAT4 splits = m_dx12->GetCascadeSplits();
     wchar_t buf[256];
-    if (m_dx12->ScatterModeOn())
-    {
-        swprintf(buf, 256,
-            L"Lab-4 | Scatter | FPS %.0f | F(frustum): %ls | O(octree): %ls | I(instancing): %ls | "
-            L"Visible %u/%u | AABB tests %u | Cull %.1f us | Draw calls %u",
-            m_fps,
-            m_dx12->FrustumCullingOn() ? L"ON" : L"OFF",
-            m_dx12->OctreeCullingOn()  ? L"ON" : L"OFF",
-            m_dx12->InstancingOn()     ? L"ON" : L"OFF",
-            m_dx12->ScatterVisibleCount(), m_dx12->ScatterTotalCount(),
-            m_dx12->LastAabbTests(), m_dx12->LastCullMicroseconds(), m_dx12->LastDrawCalls());
-    }
-    else
-    {
-        swprintf(buf, 256, L"Lab-4 | Deferred (Tab -> scatter) | FPS %.0f", m_fps);
-    }
+    swprintf(buf, 256,
+        L"Lab-5 CSM | FPS %.0f | L: lambda %.2f, splits %.1f / %.1f / %.1f / %.1f m | "
+        L"P: PCF %ls | C: cascades %ls | K: cascade culling %ls (shadow draws %u)",
+        m_fps, m_dx12->GetSplitLambda(), splits.x, splits.y, splits.z, splits.w,
+        m_dx12->PcfOn() ? L"ON" : L"OFF",
+        m_dx12->CascadeDebugOn() ? L"ON" : L"OFF",
+        m_dx12->ShadowCullingOn() ? L"ON" : L"OFF",
+        m_dx12->ShadowDrawCalls());
     SetWindowTextW(m_window->GetHwnd(), buf);
 }
 
@@ -170,10 +173,10 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (m_input) m_input->OnKeyDown((uint32_t)wparam);
         if (!(lparam & (1 << 30)) && m_dx12)
         {
-            if (wparam == VK_TAB) m_dx12->ToggleSceneMode();
-            if (wparam == 'F')    m_dx12->ToggleFrustumCulling();
-            if (wparam == 'O')    m_dx12->ToggleOctreeCulling();
-            if (wparam == 'I')    m_dx12->ToggleInstancing();
+            if (wparam == 'C') m_dx12->ToggleCascadeDebug();
+            if (wparam == 'P') m_dx12->TogglePcf();
+            if (wparam == 'K') m_dx12->ToggleShadowCulling();
+            if (wparam == 'L') m_dx12->CycleSplitLambda();
         }
         return 0;
 

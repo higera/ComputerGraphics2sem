@@ -59,10 +59,13 @@ Frustum Frustum::FromViewProj(const XMFLOAT4X4& vp)
     return f;
 }
 
-bool Frustum::Intersects(const AABB& aabb) const
+bool Frustum::Intersects(const AABB& aabb, bool skipNear) const
 {
-    for (const auto& p : Planes)
+    for (int i = 0; i < 6; ++i)
     {
+        if (skipNear && i == 4)
+            continue;
+        const Plane& p = Planes[i];
         const float px = (p.P.x >= 0.f) ? aabb.Max.x : aabb.Min.x;
         const float py = (p.P.y >= 0.f) ? aabb.Max.y : aabb.Min.y;
         const float pz = (p.P.z >= 0.f) ? aabb.Max.z : aabb.Min.z;

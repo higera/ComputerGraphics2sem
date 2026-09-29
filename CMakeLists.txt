@@ -16,6 +16,7 @@ add_executable(dx12_textures
         src/RenderingSystem.cpp
         src/Frustum.cpp
         src/Octree.cpp
+        src/ShadowMap.cpp
 )
 
 # 2. Заголовки (.h) — ищем в папке include

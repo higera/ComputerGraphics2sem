@@ -13,5 +13,5 @@ struct Frustum
 
     static Frustum FromViewProj(const DirectX::XMFLOAT4X4& viewProj);
 
-    bool Intersects(const AABB& aabb) const;
+    bool Intersects(const AABB& aabb, bool skipNear = false) const;
 };

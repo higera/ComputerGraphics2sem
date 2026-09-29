@@ -30,9 +30,9 @@ private:
     uint64_t m_prevTick = 0;
     double m_secondsPerTick = 0.0;
 
-    float m_camYaw = 0.785f;
-    float m_camPitch = -0.3f;
-    DirectX::XMFLOAT3 m_camPos{ -50.f, 30.f, -50.f };
+    float m_camYaw = 1.5708f;
+    float m_camPitch = 0.f;
+    DirectX::XMFLOAT3 m_camPos{ -6.f, 3.f, 0.f };
 
     float m_fpsTimer = 0.f;
     uint32_t m_fpsFrames = 0;

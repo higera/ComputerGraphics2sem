@@ -18,20 +18,18 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+    void RotateSun(float deltaAzimuth, float deltaHeight);
 
-    void ToggleSceneMode();
-    void ToggleFrustumCulling();
-    void ToggleOctreeCulling();
-    void ToggleInstancing();
-    bool FrustumCullingOn() const;
-    bool OctreeCullingOn() const;
-    bool ScatterModeOn() const;
-    uint32_t ScatterVisibleCount() const;
-    uint32_t ScatterTotalCount() const;
-    bool InstancingOn() const;
-    float LastCullMicroseconds() const;
-    uint32_t LastAabbTests() const;
-    uint32_t LastDrawCalls() const;
+    void ToggleCascadeDebug();
+    void TogglePcf();
+    void ToggleShadowCulling();
+    void CycleSplitLambda();
+    bool CascadeDebugOn() const;
+    bool PcfOn() const;
+    bool ShadowCullingOn() const;
+    float GetSplitLambda() const;
+    DirectX::XMFLOAT4 GetCascadeSplits() const;
+    uint32_t ShadowDrawCalls() const;
 
 private:
     std::unique_ptr<RenderingSystem> m_renderer;

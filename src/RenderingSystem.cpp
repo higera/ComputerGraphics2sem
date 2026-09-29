@@ -1,5 +1,6 @@
 #include "RenderingSystem.h"
 #include "GBuffer.h"
+#include "ShadowMap.h"
 
 #include <stdexcept>
 #include <cstdio>
@@ -14,7 +15,6 @@
 #include <cctype>
 #include <wincodec.h>
 #include <objbase.h>
-#include <random>
 
 using namespace DirectX;
 using Microsoft::WRL::ComPtr;
@@ -67,7 +67,7 @@ namespace
         return desc;
     }
 
-    D3D12_RESOURCE_DESC TextureDesc2D(uint32_t width, uint32_t height, DXGI_FORMAT format, uint16_t mipLevels = 1)
+    D3D12_RESOURCE_DESC TextureDesc2D(uint32_t width, uint32_t height, DXGI_FORMAT format, uint32_t mipLevels = 1)
     {
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -75,7 +75,7 @@ namespace
         desc.Width = width;
         desc.Height = height;
         desc.DepthOrArraySize = 1;
-        desc.MipLevels = mipLevels;
+        desc.MipLevels = static_cast<UINT16>(mipLevels);
         desc.Format = format;
         desc.SampleDesc.Count = 1;
         desc.SampleDesc.Quality = 0;
@@ -325,47 +325,13 @@ namespace
         return LowercaseExtension(path) == ".tga" ? LoadImageTga(path, out) : LoadImageWic(path, out);
     }
 
-    std::vector<Image> BuildMipChain(Image&& base)
-    {
-        std::vector<Image> mips;
-        mips.push_back(std::move(base));
-
-        while (mips.back().width > 1 || mips.back().height > 1)
-        {
-            const Image& src = mips.back();
-            Image dst;
-            dst.width = std::max(1u, src.width / 2);
-            dst.height = std::max(1u, src.height / 2);
-            dst.bgra.resize(static_cast<size_t>(dst.width) * dst.height * 4u);
-
-            for (uint32_t y = 0; y < dst.height; ++y)
-            {
-                const uint32_t y0 = std::min(2 * y, src.height - 1);
-                const uint32_t y1 = std::min(2 * y + 1, src.height - 1);
-                for (uint32_t x = 0; x < dst.width; ++x)
-                {
-                    const uint32_t x0 = std::min(2 * x, src.width - 1);
-                    const uint32_t x1 = std::min(2 * x + 1, src.width - 1);
-                    const uint8_t* p00 = &src.bgra[(static_cast<size_t>(y0) * src.width + x0) * 4u];
-                    const uint8_t* p01 = &src.bgra[(static_cast<size_t>(y0) * src.width + x1) * 4u];
-                    const uint8_t* p10 = &src.bgra[(static_cast<size_t>(y1) * src.width + x0) * 4u];
-                    const uint8_t* p11 = &src.bgra[(static_cast<size_t>(y1) * src.width + x1) * 4u];
-                    uint8_t* d = &dst.bgra[(static_cast<size_t>(y) * dst.width + x) * 4u];
-                    for (int c = 0; c < 4; ++c)
-                        d[c] = static_cast<uint8_t>((p00[c] + p01[c] + p10[c] + p11[c] + 2) / 4);
-                }
-            }
-            mips.push_back(std::move(dst));
-        }
-        return mips;
-    }
-
     struct MtlData
     {
         std::string diffusePath;
         XMFLOAT3 kd{ 1.f, 1.f, 1.f };
         XMFLOAT3 ks{ 0.18f, 0.18f, 0.18f };
         float ns = 32.f;
+        bool hasAlphaMask = false;
     };
 
     std::unordered_map<std::string, MtlData> LoadMtlData(const std::string& mtlPath)
@@ -412,6 +378,10 @@ namespace
                     last = token;
                 if (!last.empty())
                     materials[currentMaterial].diffusePath = JoinPath(baseDir, last);
+            }
+            else if (command == "map_d" && !currentMaterial.empty())
+            {
+                materials[currentMaterial].hasAlphaMask = true;
             }
         }
 
@@ -635,17 +605,60 @@ namespace
         return !out.vertices.empty() && !out.indices.empty();
     }
 
+    uint32_t MipCount(uint32_t width, uint32_t height)
+    {
+        uint32_t count = 1;
+        while (width > 1 || height > 1)
+        {
+            width = std::max(1u, width / 2);
+            height = std::max(1u, height / 2);
+            ++count;
+        }
+        return count;
+    }
+
+    Image Downsample(const Image& src)
+    {
+        Image dst;
+        dst.width = std::max(1u, src.width / 2);
+        dst.height = std::max(1u, src.height / 2);
+        dst.bgra.resize(static_cast<size_t>(dst.width) * dst.height * 4u);
+
+        for (uint32_t y = 0; y < dst.height; ++y)
+        {
+            for (uint32_t x = 0; x < dst.width; ++x)
+            {
+                const uint32_t x0 = std::min(x * 2, src.width - 1), x1 = std::min(x * 2 + 1, src.width - 1);
+                const uint32_t y0 = std::min(y * 2, src.height - 1), y1 = std::min(y * 2 + 1, src.height - 1);
+                for (uint32_t c = 0; c < 4; ++c)
+                {
+                    const uint32_t sum =
+                        src.bgra[(static_cast<size_t>(y0) * src.width + x0) * 4u + c] +
+                        src.bgra[(static_cast<size_t>(y0) * src.width + x1) * 4u + c] +
+                        src.bgra[(static_cast<size_t>(y1) * src.width + x0) * 4u + c] +
+                        src.bgra[(static_cast<size_t>(y1) * src.width + x1) * 4u + c];
+                    dst.bgra[(static_cast<size_t>(y) * dst.width + x) * 4u + c] = static_cast<uint8_t>((sum + 2) / 4);
+                }
+            }
+        }
+        return dst;
+    }
+
     void UploadTexture(
         ID3D12Device* device,
         ID3D12GraphicsCommandList* commandList,
         ID3D12Resource* texture,
-        const std::vector<Image>& mips,
+        const Image& image,
         std::vector<ComPtr<ID3D12Resource>>& uploadResources)
     {
-        const UINT mipCount = static_cast<UINT>(mips.size());
         auto uploadHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
-        const D3D12_RESOURCE_DESC textureDesc =
-            TextureDesc2D(mips[0].width, mips[0].height, DXGI_FORMAT_B8G8R8A8_UNORM, static_cast<uint16_t>(mipCount));
+        const uint32_t mipCount = MipCount(image.width, image.height);
+        const D3D12_RESOURCE_DESC textureDesc = TextureDesc2D(image.width, image.height, DXGI_FORMAT_B8G8R8A8_UNORM, mipCount);
+
+        std::vector<Image> mips(mipCount);
+        mips[0] = image;
+        for (uint32_t m = 1; m < mipCount; ++m)
+            mips[m] = Downsample(mips[m - 1]);
 
         std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mipCount);
         UINT64 totalBytes = 0;
@@ -663,37 +676,36 @@ namespace
                 IID_PPV_ARGS(&uploadBuffer)),
             "Create texture upload buffer");
 
-        uint8_t* mapped = nullptr;
+        void* mapped = nullptr;
         D3D12_RANGE readRange{ 0, 0 };
-        ThrowIfFailed(uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped)), "Map texture upload buffer");
+        ThrowIfFailed(uploadBuffer->Map(0, &readRange, &mapped), "Map texture upload buffer");
 
-        for (UINT mip = 0; mip < mipCount; ++mip)
+        for (uint32_t m = 0; m < mipCount; ++m)
         {
-            const Image& image = mips[mip];
-            const uint32_t srcRowPitch = image.width * 4u;
-            const uint32_t dstRowPitch = footprints[mip].Footprint.RowPitch;
-            uint8_t* dstBase = mapped + footprints[mip].Offset;
-            for (uint32_t y = 0; y < image.height; ++y)
+            const Image& level = mips[m];
+            const uint32_t srcRowPitch = level.width * 4u;
+            uint8_t* dstBase = static_cast<uint8_t*>(mapped) + footprints[m].Offset;
+            for (uint32_t y = 0; y < level.height; ++y)
             {
                 std::memcpy(
-                    dstBase + static_cast<size_t>(y) * dstRowPitch,
-                    image.bgra.data() + static_cast<size_t>(y) * srcRowPitch,
+                    dstBase + static_cast<size_t>(y) * footprints[m].Footprint.RowPitch,
+                    level.bgra.data() + static_cast<size_t>(y) * srcRowPitch,
                     srcRowPitch);
             }
         }
         uploadBuffer->Unmap(0, nullptr);
 
-        for (UINT mip = 0; mip < mipCount; ++mip)
+        for (uint32_t m = 0; m < mipCount; ++m)
         {
             D3D12_TEXTURE_COPY_LOCATION dst{};
             dst.pResource = texture;
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = mip;
+            dst.SubresourceIndex = m;
 
             D3D12_TEXTURE_COPY_LOCATION src{};
             src.pResource = uploadBuffer.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint = footprints[mip];
+            src.PlacedFootprint = footprints[m];
 
             commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
@@ -748,11 +760,11 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_viewport = { 0.f, 0.f, static_cast<float>(m_width), static_cast<float>(m_height), 0.f, 1.f };
     m_scissorRect = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
 
-    XMStoreFloat4x4(&m_world, XMMatrixScaling(1.f, 1.f, 1.f));
+    XMStoreFloat4x4(&m_world, XMMatrixScaling(0.01f, 0.01f, 0.01f));
     SetCamera(m_eyePos, 1.f, 0.f);
 
     const float aspect = (m_height > 0) ? static_cast<float>(m_width) / static_cast<float>(m_height) : 1.f;
-    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 200.f));
+    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(kFovY, aspect, kNearZ, kFarZ));
 
     BuildShaders();
     BuildRootSignature();
@@ -762,12 +774,13 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_gBuffer = std::make_unique<GBuffer>();
     m_gBuffer->Initialize(m_device.Get(), m_width, m_height);
 
+    m_shadowMap = std::make_unique<ShadowMap>();
+    m_shadowMap->Initialize(m_device.Get(), m_gBuffer->GetShadowSrvCpu());
+
     CreateSceneLights();
     UpdatePassConstants();
     UpdateLightConstants(0.f);
     BuildPSOs();
-    if (!BuildScatterResources())
-        return false;
 
     m_initialized = true;
     return true;
@@ -794,22 +807,16 @@ void RenderingSystem::Shutdown()
         m_mappedLightConstants = nullptr;
     }
 
+    if (m_shadowMap)
+    {
+        m_shadowMap->Shutdown();
+        m_shadowMap.reset();
+    }
+
     if (m_gBuffer)
     {
         m_gBuffer->Shutdown();
         m_gBuffer.reset();
-    }
-
-    if (m_scatterViewCB && m_mappedScatterViewCB)
-    {
-        m_scatterViewCB->Unmap(0, nullptr);
-        m_mappedScatterViewCB = nullptr;
-    }
-
-    if (m_instanceBuffer && m_mappedInstanceBuffer)
-    {
-        m_instanceBuffer->Unmap(0, nullptr);
-        m_mappedInstanceBuffer = nullptr;
     }
 
     if (m_fenceEvent)
@@ -848,7 +855,7 @@ void RenderingSystem::OnResize(uint32_t width, uint32_t height)
     m_scissorRect = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
 
     const float aspect = static_cast<float>(m_width) / static_cast<float>(m_height);
-    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 200.f));
+    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(kFovY, aspect, kNearZ, kFarZ));
 
     UpdatePassConstants();
 }
@@ -861,98 +868,9 @@ void RenderingSystem::Draw(float dt)
     UpdatePassConstants();
     UpdateLightConstants(dt);
 
-    if (m_sceneMode == 1)
-    {
-        UpdateScatterVisible();
-
-        ThrowIfFailed(m_commandAllocator->Reset(), "Reset allocator (scatter)");
-        ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset list (scatter)");
-
-        D3D12_RESOURCE_BARRIER toRT{};
-        toRT.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        toRT.Transition.pResource   = CurrentBackBuffer();
-        toRT.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        toRT.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        toRT.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        m_commandList->ResourceBarrier(1, &toRT);
-
-        const auto rtv = CurrentBackBufferRTV();
-        const auto dsv = m_gBuffer->GetDsv();
-        const float clear[4] = { 0.10f, 0.15f, 0.20f, 1.f };
-        m_commandList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        m_commandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
-
-        m_commandList->RSSetViewports(1, &m_viewport);
-        m_commandList->RSSetScissorRects(1, &m_scissorRect);
-        m_commandList->SetGraphicsRootSignature(m_scatterRootSig.Get());
-        m_commandList->SetPipelineState(m_scatterPSO.Get());
-        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
-        m_commandList->IASetIndexBuffer(&m_indexBufferView);
-
-        ID3D12DescriptorHeap* heaps[] = { m_textureHeap.Get() };
-        m_commandList->SetDescriptorHeaps(1, heaps);
-
-        m_commandList->SetGraphicsRootConstantBufferView(0, m_scatterViewCB->GetGPUVirtualAddress());
-
-        const auto textureHeapStart = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
-        m_lastDrawCalls = 0;
-
-        if (m_useInstancing)
-        {
-            XMFLOAT4X4* dst = reinterpret_cast<XMFLOAT4X4*>(m_mappedInstanceBuffer);
-            for (size_t i = 0; i < m_scatterVisible.size(); ++i)
-                dst[i] = m_scatterInstances[m_scatterVisible[i]].WorldT;
-
-            m_commandList->SetPipelineState(m_scatterInstancedPSO.Get());
-            m_commandList->SetGraphicsRootShaderResourceView(3, m_instanceBuffer->GetGPUVirtualAddress());
-
-            const UINT instanceCount = static_cast<UINT>(m_scatterVisible.size());
-            if (instanceCount > 0)
-            {
-                for (const DrawItem& di : m_drawItems)
-                {
-                    D3D12_GPU_DESCRIPTOR_HANDLE texHandle = textureHeapStart;
-                    texHandle.ptr += static_cast<UINT64>(di.TextureIndex) * m_srvDescriptorSize;
-                    m_commandList->SetGraphicsRootDescriptorTable(2, texHandle);
-                    m_commandList->DrawIndexedInstanced(di.IndexCount, instanceCount, di.StartIndexLocation, 0, 0);
-                    ++m_lastDrawCalls;
-                }
-            }
-        }
-        else
-        {
-            for (uint32_t idx : m_scatterVisible)
-            {
-                m_commandList->SetGraphicsRoot32BitConstants(1, 16, &m_scatterInstances[idx].WorldT, 0);
-
-                for (const DrawItem& di : m_drawItems)
-                {
-                    D3D12_GPU_DESCRIPTOR_HANDLE texHandle = textureHeapStart;
-                    texHandle.ptr += static_cast<UINT64>(di.TextureIndex) * m_srvDescriptorSize;
-                    m_commandList->SetGraphicsRootDescriptorTable(2, texHandle);
-
-                    m_commandList->DrawIndexedInstanced(di.IndexCount, 1, di.StartIndexLocation, 0, 0);
-                    ++m_lastDrawCalls;
-                }
-            }
-        }
-
-        D3D12_RESOURCE_BARRIER toPresent = toRT;
-        toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-        m_commandList->ResourceBarrier(1, &toPresent);
-
-        ThrowIfFailed(m_commandList->Close(), "Close list (scatter)");
-        ID3D12CommandList* lists[] = { m_commandList.Get() };
-        m_commandQueue->ExecuteCommandLists(1, lists);
-
-        ThrowIfFailed(m_swapChain->Present(0, 0), "Present (scatter)");
-        m_backBufferIndex = (m_backBufferIndex + 1) % SwapChainBufferCount;
-        FlushCommandQueue();
-        return;
-    }
+    const float aspect = static_cast<float>(m_width) / static_cast<float>(m_height);
+    m_shadowMap->UpdateCascades(m_view, kFovY, aspect, kNearZ, kShadowDistance, m_sunDir);
+    m_shadowMap->SetDebugParams(m_showCascades, m_usePcf);
 
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator");
     ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset command list");
@@ -961,6 +879,62 @@ void RenderingSystem::Draw(float dt)
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
 
+    m_shadowMap->TransitionToWrite(m_commandList.Get());
+
+    const D3D12_VIEWPORT shadowViewport = { 0.f, 0.f, static_cast<float>(ShadowMap::Size), static_cast<float>(ShadowMap::Size), 0.f, 1.f };
+    const D3D12_RECT shadowScissor = { 0, 0, static_cast<LONG>(ShadowMap::Size), static_cast<LONG>(ShadowMap::Size) };
+    m_commandList->RSSetViewports(1, &shadowViewport);
+    m_commandList->RSSetScissorRects(1, &shadowScissor);
+
+    m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
+    m_commandList->IASetIndexBuffer(&m_indexBufferView);
+
+    ID3D12DescriptorHeap* shadowHeaps[] = { m_textureHeap.Get() };
+    m_commandList->SetDescriptorHeaps(1, shadowHeaps);
+    const auto shadowTextureHeapStart = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
+
+    m_shadowDrawCalls = 0;
+    for (uint32_t c = 0; c < ShadowMap::CascadeCount; ++c)
+    {
+        const D3D12_CPU_DESCRIPTOR_HANDLE cascadeDsv = m_shadowMap->GetDsv(c);
+        m_commandList->OMSetRenderTargets(0, nullptr, FALSE, &cascadeDsv);
+        m_commandList->ClearDepthStencilView(cascadeDsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
+        m_commandList->SetGraphicsRoot32BitConstants(6, 16, &m_shadowMap->GetConstants().LightViewProj[c], 0);
+
+        const Frustum cascadeFrustum = m_shadowMap->GetCascadeFrustum(c);
+
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            const bool alphaPass = (pass == 1);
+            m_commandList->SetPipelineState(alphaPass ? m_shadowAlphaPSO.Get() : m_shadowPSO.Get());
+
+            for (const DrawItem& drawItem : m_drawItems)
+            {
+                const bool isAlpha = drawItem.Material.SurfaceParams.z > 0.5f;
+                if (isAlpha != alphaPass)
+                    continue;
+                if (m_shadowCulling && !cascadeFrustum.Intersects(drawItem.WorldBounds,  true))
+                    continue;
+
+                if (alphaPass)
+                {
+                    D3D12_GPU_DESCRIPTOR_HANDLE textureHandle = shadowTextureHeapStart;
+                    textureHandle.ptr += static_cast<UINT64>(drawItem.TextureIndex) * m_srvDescriptorSize;
+                    m_commandList->SetGraphicsRootDescriptorTable(1, textureHandle);
+                    m_commandList->SetGraphicsRoot32BitConstants(2, 8, &drawItem.Material, 0);
+                }
+                m_commandList->DrawIndexedInstanced(drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
+                ++m_shadowDrawCalls;
+            }
+        }
+    }
+
+    m_shadowMap->TransitionToRead(m_commandList.Get());
+
+    m_commandList->RSSetViewports(1, &m_viewport);
+    m_commandList->RSSetScissorRects(1, &m_scissorRect);
     m_gBuffer->TransitionToWrite(m_commandList.Get());
     m_gBuffer->BindForGeometryPass(m_commandList.Get());
 
@@ -1003,6 +977,7 @@ void RenderingSystem::Draw(float dt)
     m_commandList->SetPipelineState(m_lightingPSO.Get());
     m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
     m_commandList->SetGraphicsRootConstantBufferView(3, m_lightConstantBuffer->GetGPUVirtualAddress());
+    m_commandList->SetGraphicsRootConstantBufferView(5, m_shadowMap->GetConstantsGpuAddress());
 
     ID3D12DescriptorHeap* lightingHeaps[] = { m_gBuffer->GetSrvHeap() };
     m_commandList->SetDescriptorHeaps(1, lightingHeaps);
@@ -1141,6 +1116,8 @@ bool RenderingSystem::BuildShaders()
     compile("GeometryPS", "ps_5_0", m_geometryPS);
     compile("LightingVS", "vs_5_0", m_lightingVS);
     compile("LightingPS", "ps_5_0", m_lightingPS);
+    compile("ShadowVS", "vs_5_0", m_shadowVS);
+    compile("ShadowAlphaPS", "ps_5_0", m_shadowAlphaPS);
 
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
@@ -1159,12 +1136,12 @@ bool RenderingSystem::BuildRootSignature()
 
     D3D12_DESCRIPTOR_RANGE gbufferRange{};
     gbufferRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    gbufferRange.NumDescriptors = 3;
+    gbufferRange.NumDescriptors = 4;
     gbufferRange.BaseShaderRegister = 1;
     gbufferRange.RegisterSpace = 0;
     gbufferRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[5]{};
+    D3D12_ROOT_PARAMETER params[7]{};
 
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
@@ -1192,13 +1169,24 @@ bool RenderingSystem::BuildRootSignature()
     params[4].DescriptorTable.pDescriptorRanges = &gbufferRange;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[5].Descriptor.ShaderRegister = 3;
+    params[5].Descriptor.RegisterSpace = 0;
+    params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[6].Constants.ShaderRegister = 4;
+    params[6].Constants.RegisterSpace = 0;
+    params[6].Constants.Num32BitValues = 16;
+    params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.MipLODBias = 0.f;
-    sampler.MaxAnisotropy = 8;
+    sampler.MaxAnisotropy = 16;
     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
     sampler.MinLOD = 0.f;
@@ -1207,11 +1195,27 @@ bool RenderingSystem::BuildRootSignature()
     sampler.RegisterSpace = 0;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    D3D12_STATIC_SAMPLER_DESC shadowSampler{};
+    shadowSampler.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    shadowSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    shadowSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    shadowSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    shadowSampler.MaxAnisotropy = 1;
+    shadowSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    shadowSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    shadowSampler.MinLOD = 0.f;
+    shadowSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    shadowSampler.ShaderRegister = 1;
+    shadowSampler.RegisterSpace = 0;
+    shadowSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC samplers[2] = { sampler, shadowSampler };
+
     D3D12_ROOT_SIGNATURE_DESC desc{};
     desc.NumParameters = static_cast<UINT>(_countof(params));
     desc.pParameters = params;
-    desc.NumStaticSamplers = 1;
-    desc.pStaticSamplers = &sampler;
+    desc.NumStaticSamplers = 2;
+    desc.pStaticSamplers = samplers;
     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ComPtr<ID3DBlob> serialized;
@@ -1304,18 +1308,34 @@ bool RenderingSystem::BuildPSOs()
     lightingPso.SampleDesc.Quality = 0;
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&lightingPso, IID_PPV_ARGS(&m_lightingPSO)), "Create lighting PSO");
 
+    D3D12_RASTERIZER_DESC shadowRaster = rasterizer;
+    shadowRaster.DepthClipEnable = FALSE;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowPso{};
+    shadowPso.pRootSignature = m_rootSignature.Get();
+    shadowPso.VS = { m_shadowVS->GetBufferPointer(), m_shadowVS->GetBufferSize() };
+    shadowPso.BlendState = blend;
+    shadowPso.SampleMask = UINT_MAX;
+    shadowPso.RasterizerState = shadowRaster;
+    shadowPso.DepthStencilState = geometryDepth;
+    shadowPso.InputLayout = { m_inputLayout, static_cast<UINT>(_countof(m_inputLayout)) };
+    shadowPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    shadowPso.NumRenderTargets = 0;
+    shadowPso.DSVFormat = m_shadowMap->GetDsvFormat();
+    shadowPso.SampleDesc.Count = 1;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&shadowPso, IID_PPV_ARGS(&m_shadowPSO)), "Create shadow PSO");
+
+    shadowPso.PS = { m_shadowAlphaPS->GetBufferPointer(), m_shadowAlphaPS->GetBufferSize() };
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&shadowPso, IID_PPV_ARGS(&m_shadowAlphaPSO)), "Create alpha-tested shadow PSO");
+
     return true;
 }
 
 bool RenderingSystem::BuildGeometry()
 {
     ObjMesh model{};
-    if (!LoadObj(ResolveAssetPath("models/gnome/gnome.obj"), model))
-        throw std::runtime_error("Failed to load gnome.obj");
-
-    m_meshBounds = AABB{};
-    for (const Vertex& v : model.vertices)
-        m_meshBounds.Expand(v.Pos);
+    if (!LoadObj(ResolveAssetPath("sponza/sponza.obj"), model))
+        throw std::runtime_error("Failed to load sponza.obj");
 
     std::unordered_map<std::string, uint32_t> pathToIndex;
     std::vector<std::string> uniquePaths;
@@ -1342,6 +1362,11 @@ bool RenderingSystem::BuildGeometry()
         drawItem.StartIndexLocation = group.start;
         drawItem.IndexCount = group.count;
 
+        AABB localBounds;
+        for (uint32_t k = 0; k < group.count; ++k)
+            localBounds.Expand(model.vertices[model.indices[group.start + k]].Pos);
+        drawItem.WorldBounds = TransformAABB(localBounds, m_world);
+
         const auto materialIt = model.materials.find(group.material);
         if (materialIt != model.materials.end())
         {
@@ -1351,6 +1376,7 @@ bool RenderingSystem::BuildGeometry()
             const float ksAverage = (material.ks.x + material.ks.y + material.ks.z) / 3.f;
             drawItem.Material.SurfaceParams.x = std::max(0.04f, ksAverage);
             drawItem.Material.SurfaceParams.y = std::max(8.f, std::min(material.ns, 128.f));
+            drawItem.Material.SurfaceParams.z = material.hasAlphaMask ? 1.f : 0.f;
         }
 
         m_drawItems.push_back(drawItem);
@@ -1392,22 +1418,15 @@ bool RenderingSystem::BuildGeometry()
     ComPtr<ID3D12Resource> vbUpload = createUploadBuffer(vbSize, model.vertices.data());
     ComPtr<ID3D12Resource> ibUpload = createUploadBuffer(ibSize, model.indices.data());
 
-    std::vector<std::vector<Image>> mipChains(uniquePaths.size());
+    std::vector<Image> images(uniquePaths.size());
     std::vector<bool> loaded(uniquePaths.size(), false);
     for (size_t i = 0; i < uniquePaths.size(); ++i)
-    {
-        Image image;
-        loaded[i] = LoadImageFile(uniquePaths[i], image);
-        if (loaded[i])
-            mipChains[i] = BuildMipChain(std::move(image));
-        else
-            OutputDebugStringA(("Texture not loaded: " + uniquePaths[i] + "\n").c_str());
-    }
+        loaded[i] = LoadImageFile(uniquePaths[i], images[i]);
 
-    auto createTexture = [&](uint32_t width, uint32_t height, uint16_t mipLevels) -> ComPtr<ID3D12Resource>
+    auto createTexture = [&](uint32_t width, uint32_t height) -> ComPtr<ID3D12Resource>
     {
         ComPtr<ID3D12Resource> texture;
-        const D3D12_RESOURCE_DESC desc = TextureDesc2D(width, height, DXGI_FORMAT_B8G8R8A8_UNORM, mipLevels);
+        const D3D12_RESOURCE_DESC desc = TextureDesc2D(width, height, DXGI_FORMAT_B8G8R8A8_UNORM, MipCount(width, height));
         ThrowIfFailed(
             m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)),
             "Create texture");
@@ -1416,12 +1435,11 @@ bool RenderingSystem::BuildGeometry()
 
     m_textures.clear();
     m_textures.resize(uniquePaths.size() + 1u);
-    m_textures[0] = createTexture(1, 1, 1);
+    m_textures[0] = createTexture(1, 1);
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            m_textures[i + 1] = createTexture(
-                mipChains[i][0].width, mipChains[i][0].height, static_cast<uint16_t>(mipChains[i].size()));
+            m_textures[i + 1] = createTexture(images[i].width, images[i].height);
         else
             m_textures[i + 1] = m_textures[0];
     }
@@ -1448,16 +1466,16 @@ bool RenderingSystem::BuildGeometry()
     m_commandList->ResourceBarrier(2, bufferBarriers);
 
     std::vector<ComPtr<ID3D12Resource>> textureUploads;
-    std::vector<Image> whiteTexture(1);
-    whiteTexture[0].width = 1;
-    whiteTexture[0].height = 1;
-    whiteTexture[0].bgra = { 255, 255, 255, 255 };
+    Image whiteTexture;
+    whiteTexture.width = 1;
+    whiteTexture.height = 1;
+    whiteTexture.bgra = { 255, 255, 255, 255 };
     UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[0].Get(), whiteTexture, textureUploads);
 
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + 1].Get(), mipChains[i], textureUploads);
+            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + 1].Get(), images[i], textureUploads);
     }
 
     ThrowIfFailed(m_commandList->Close(), "Close geometry upload command list");
@@ -1552,7 +1570,7 @@ void RenderingSystem::UpdateLightConstants(float dt)
     m_time += dt;
 
     LightConstants constants{};
-    constants.AmbientColor = XMFLOAT4(0.25f, 0.25f, 0.28f, 1.f);
+    constants.AmbientColor = XMFLOAT4(0.18f, 0.19f, 0.22f, 1.f);
 
     const uint32_t lightCount = static_cast<uint32_t>(std::min<size_t>(m_sceneLights.size(), MaxLights));
     constants.LightCount = XMFLOAT4(static_cast<float>(lightCount), 0.f, 0.f, 0.f);
@@ -1572,6 +1590,45 @@ void RenderingSystem::UpdateLightConstants(float dt)
     std::memcpy(m_mappedLightConstants, &constants, sizeof(constants));
 }
 
+void RenderingSystem::RotateSun(float deltaAzimuth, float deltaHeight)
+{
+    float azimuth = std::atan2(m_sunDir.x, m_sunDir.z);
+    float height = std::asin(std::clamp(-m_sunDir.y, -1.f, 1.f));
+
+    azimuth += deltaAzimuth;
+    height = std::clamp(height + deltaHeight, 0.15f, XM_PIDIV2 - 0.05f);
+
+    m_sunDir = XMFLOAT3(
+        std::cos(height) * std::sin(azimuth),
+        -std::sin(height),
+        std::cos(height) * std::cos(azimuth));
+
+    if (!m_sceneLights.empty())
+        m_sceneLights[0].DirectionSpot = XMFLOAT4(m_sunDir.x, m_sunDir.y, m_sunDir.z, 0.f);
+}
+
+void RenderingSystem::ToggleCascadeDebug() { m_showCascades = !m_showCascades; }
+void RenderingSystem::TogglePcf()          { m_usePcf = !m_usePcf; }
+void RenderingSystem::ToggleShadowCulling() { m_shadowCulling = !m_shadowCulling; }
+
+void RenderingSystem::CycleSplitLambda()
+{
+    static const float kLambdas[] = { 0.f, 0.5f, 0.75f, 0.9f, 1.f };
+    m_lambdaIndex = (m_lambdaIndex + 1) % static_cast<int>(_countof(kLambdas));
+    if (m_shadowMap)
+        m_shadowMap->SetSplitLambda(kLambdas[m_lambdaIndex]);
+}
+
+float RenderingSystem::GetSplitLambda() const
+{
+    return m_shadowMap ? m_shadowMap->GetSplitLambda() : 0.f;
+}
+
+DirectX::XMFLOAT4 RenderingSystem::GetCascadeSplits() const
+{
+    return m_shadowMap ? m_shadowMap->GetConstants().CascadeSplits : DirectX::XMFLOAT4{};
+}
+
 void RenderingSystem::CreateSceneLights()
 {
     auto normalize = [](const XMFLOAT3& v) -> XMFLOAT3
@@ -1581,13 +1638,13 @@ void RenderingSystem::CreateSceneLights()
         return out;
     };
 
-    auto makeDirectional = [&](const XMFLOAT3& direction, const XMFLOAT3& color, float intensity) -> GpuLight
+    auto makeDirectional = [&](const XMFLOAT3& direction, const XMFLOAT3& color, float intensity, bool castsShadow) -> GpuLight
     {
         GpuLight light{};
         const XMFLOAT3 dir = normalize(direction);
         light.DirectionSpot = XMFLOAT4(dir.x, dir.y, dir.z, 0.f);
         light.ColorIntensity = XMFLOAT4(color.x, color.y, color.z, intensity);
-        light.Params = XMFLOAT4(0.f, 0.f, 0.f, 0.f);
+        light.Params = XMFLOAT4(0.f, 0.f, castsShadow ? 1.f : 0.f, 0.f);
         return light;
     };
 
@@ -1616,7 +1673,10 @@ void RenderingSystem::CreateSceneLights()
 
     m_sceneLights.clear();
 
-    m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.4f, -1.f, 0.3f), XMFLOAT3(1.f, 0.97f, 0.9f), 1.f));
+    m_sceneLights.push_back(makeDirectional(m_sunDir, XMFLOAT3(1.0f, 0.93f, 0.80f), 1.7f, true));
+
+    m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.30f, -0.45f, -0.85f), XMFLOAT3(0.55f, 0.65f, 0.95f), 0.45f, false));
+
 }
 
 void RenderingSystem::FlushCommandQueue()
@@ -1628,278 +1688,6 @@ void RenderingSystem::FlushCommandQueue()
         ThrowIfFailed(m_fence->SetEventOnCompletion(value, m_fenceEvent), "Set fence event");
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
-}
-
-void RenderingSystem::ToggleSceneMode()
-{
-    m_sceneMode = (m_sceneMode + 1) % 2;
-}
-
-void RenderingSystem::ToggleInstancing()
-{
-    m_useInstancing = !m_useInstancing;
-}
-
-void RenderingSystem::ToggleFrustumCulling()
-{
-    m_useFrustumCulling = !m_useFrustumCulling;
-    if (m_useFrustumCulling)
-        m_useOctreeCulling = false;
-}
-
-void RenderingSystem::ToggleOctreeCulling()
-{
-    m_useOctreeCulling = !m_useOctreeCulling;
-    if (m_useOctreeCulling)
-        m_useFrustumCulling = false;
-}
-
-bool RenderingSystem::BuildScatterResources()
-{
-    if (m_drawItems.empty())
-        return false;
-
-    m_scatterInstances.clear();
-    m_scatterInstances.reserve(kScatterInstanceCount);
-
-    const float spacing = 2.0f;
-    const float half = (kScatterGridSide - 1) * 0.5f * spacing;
-    const AABB localBounds = m_meshBounds;
-
-    std::mt19937 rng(12345);
-    std::uniform_real_distribution<float> jitter(-0.6f, 0.6f);
-    std::uniform_real_distribution<float> angle(0.f, XM_2PI);
-    std::uniform_real_distribution<float> scale(0.8f, 1.4f);
-
-    for (uint32_t z = 0; z < kScatterGridSide; ++z)
-    {
-        for (uint32_t x = 0; x < kScatterGridSide; ++x)
-        {
-            const float px = x * spacing - half + jitter(rng);
-            const float pz = z * spacing - half + jitter(rng);
-            const float s  = scale(rng);
-
-            ScatterInstance inst{};
-            const XMMATRIX world = XMMatrixScaling(s, s, s)
-                                 * XMMatrixRotationY(angle(rng))
-                                 * XMMatrixTranslation(px, 0.f, pz);
-            XMStoreFloat4x4(&inst.World, world);
-            XMStoreFloat4x4(&inst.WorldT, XMMatrixTranspose(world));
-            inst.WorldBounds = TransformAABB(localBounds, inst.World);
-            m_scatterInstances.push_back(inst);
-        }
-    }
-
-    std::vector<AABB> worldBounds;
-    worldBounds.reserve(m_scatterInstances.size());
-    for (const auto& inst : m_scatterInstances)
-        worldBounds.push_back(inst.WorldBounds);
-
-    AABB sceneBounds = worldBounds[0];
-    for (const auto& b : worldBounds)
-    {
-        sceneBounds.Min.x = std::min(sceneBounds.Min.x, b.Min.x);
-        sceneBounds.Min.y = std::min(sceneBounds.Min.y, b.Min.y);
-        sceneBounds.Min.z = std::min(sceneBounds.Min.z, b.Min.z);
-        sceneBounds.Max.x = std::max(sceneBounds.Max.x, b.Max.x);
-        sceneBounds.Max.y = std::max(sceneBounds.Max.y, b.Max.y);
-        sceneBounds.Max.z = std::max(sceneBounds.Max.z, b.Max.z);
-    }
-    sceneBounds.Min.x -= 1.f; sceneBounds.Min.y -= 1.f; sceneBounds.Min.z -= 1.f;
-    sceneBounds.Max.x += 1.f; sceneBounds.Max.y += 1.f; sceneBounds.Max.z += 1.f;
-
-    m_scatterOctree.Build(worldBounds, sceneBounds, 6, 8);
-    m_scatterOctreeBuilt = true;
-
-    {
-        UINT flags = 0;
-#if defined(_DEBUG)
-        flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#endif
-        ComPtr<ID3DBlob> errors;
-        const std::wstring sp = ToWide(ResolveAssetPath("shaders/ScatterScene.hlsl"));
-
-        auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob)
-        {
-            errors.Reset();
-            HRESULT hr = D3DCompileFromFile(sp.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
-                entry, target, flags, 0, &blob, &errors);
-            if (FAILED(hr))
-            {
-                if (errors) throw std::runtime_error((const char*)errors->GetBufferPointer());
-                ThrowIfFailed(hr, entry);
-            }
-        };
-        compile("VS", "vs_5_0", m_scatterVS);
-        compile("VSInstanced", "vs_5_0", m_scatterInstancedVS);
-        compile("PS", "ps_5_0", m_scatterPS);
-    }
-
-    {
-        D3D12_DESCRIPTOR_RANGE srvRange{};
-        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRange.NumDescriptors = 1;
-        srvRange.BaseShaderRegister = 0;
-        srvRange.RegisterSpace = 0;
-        srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-        D3D12_ROOT_PARAMETER params[4]{};
-
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        params[0].Descriptor.ShaderRegister = 0;
-        params[0].Descriptor.RegisterSpace = 0;
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[1].Constants.ShaderRegister = 1;
-        params[1].Constants.RegisterSpace = 0;
-        params[1].Constants.Num32BitValues = 16;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[2].DescriptorTable.NumDescriptorRanges = 1;
-        params[2].DescriptorTable.pDescriptorRanges = &srvRange;
-        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        params[3].Descriptor.ShaderRegister = 1;
-        params[3].Descriptor.RegisterSpace = 0;
-        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-
-        D3D12_STATIC_SAMPLER_DESC samp{};
-        samp.Filter = D3D12_FILTER_ANISOTROPIC;
-        samp.MaxAnisotropy = 8;
-        samp.MinLOD = 0.f;
-        samp.MaxLOD = D3D12_FLOAT32_MAX;
-        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samp.MipLODBias = 0.f;
-        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        samp.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
-        samp.ShaderRegister = 0;
-        samp.RegisterSpace = 0;
-        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-        D3D12_ROOT_SIGNATURE_DESC desc{};
-        desc.NumParameters = static_cast<UINT>(_countof(params));
-        desc.pParameters = params;
-        desc.NumStaticSamplers = 1;
-        desc.pStaticSamplers = &samp;
-        desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-        ComPtr<ID3DBlob> serialized, err;
-        HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &err);
-        if (FAILED(hr))
-        {
-            if (err) throw std::runtime_error((const char*)err->GetBufferPointer());
-            ThrowIfFailed(hr, "SerializeScatterRS");
-        }
-        ThrowIfFailed(m_device->CreateRootSignature(0, serialized->GetBufferPointer(),
-            serialized->GetBufferSize(), IID_PPV_ARGS(&m_scatterRootSig)), "ScatterRS");
-    }
-
-    {
-        D3D12_RASTERIZER_DESC rast{};
-        rast.FillMode = D3D12_FILL_MODE_SOLID;
-        rast.CullMode = D3D12_CULL_MODE_BACK;
-        rast.FrontCounterClockwise = FALSE;
-        rast.DepthClipEnable = TRUE;
-
-        D3D12_BLEND_DESC blend{};
-        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-
-        D3D12_DEPTH_STENCIL_DESC ds{};
-        ds.DepthEnable = TRUE;
-        ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-        ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
-        pso.pRootSignature = m_scatterRootSig.Get();
-        pso.VS = { m_scatterVS->GetBufferPointer(), m_scatterVS->GetBufferSize() };
-        pso.PS = { m_scatterPS->GetBufferPointer(), m_scatterPS->GetBufferSize() };
-        pso.BlendState = blend;
-        pso.SampleMask = UINT_MAX;
-        pso.RasterizerState = rast;
-        pso.DepthStencilState = ds;
-        pso.InputLayout = { m_inputLayout, 3 };
-        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pso.NumRenderTargets = 1;
-        pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
-        pso.SampleDesc.Count = 1;
-
-        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_scatterPSO)), "ScatterPSO");
-
-        pso.VS = { m_scatterInstancedVS->GetBufferPointer(), m_scatterInstancedVS->GetBufferSize() };
-        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_scatterInstancedPSO)), "ScatterInstancedPSO");
-    }
-
-    {
-        auto upHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
-        struct ScatterViewCB { XMFLOAT4X4 ViewProj; XMFLOAT4 Eye; XMFLOAT4 LightDir; };
-        const uint32_t sz = AlignConstantBufferSize(sizeof(ScatterViewCB));
-        const auto desc = BufferDesc(sz);
-        ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_scatterViewCB)), "ScatterViewCB");
-        D3D12_RANGE rr{0,0};
-        ThrowIfFailed(m_scatterViewCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedScatterViewCB)), "Map ScatterViewCB");
-
-        const auto instDesc = BufferDesc(static_cast<UINT64>(kScatterInstanceCount) * sizeof(XMFLOAT4X4));
-        ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &instDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_instanceBuffer)), "InstanceBuffer");
-        ThrowIfFailed(m_instanceBuffer->Map(0, &rr, reinterpret_cast<void**>(&m_mappedInstanceBuffer)), "Map InstanceBuffer");
-    }
-
-    return true;
-}
-
-void RenderingSystem::UpdateScatterVisible()
-{
-    struct ScatterViewCB { XMFLOAT4X4 ViewProj; XMFLOAT4 Eye; XMFLOAT4 LightDir; };
-    ScatterViewCB cb{};
-    const XMMATRIX vp = XMLoadFloat4x4(&m_view) * XMLoadFloat4x4(&m_proj);
-    XMStoreFloat4x4(&cb.ViewProj, XMMatrixTranspose(vp));
-    cb.Eye = { m_eyePos.x, m_eyePos.y, m_eyePos.z, 1.f };
-    cb.LightDir = { 0.4f, -1.f, 0.3f, 0.f };
-    std::memcpy(m_mappedScatterViewCB, &cb, sizeof(cb));
-
-    LARGE_INTEGER freq{}, t0{}, t1{};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-    auto finishTiming = [&]()
-    {
-        QueryPerformanceCounter(&t1);
-        m_lastCullMicroseconds = static_cast<float>(
-            static_cast<double>(t1.QuadPart - t0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart));
-    };
-
-    if (!m_useFrustumCulling && !m_useOctreeCulling)
-    {
-        m_scatterVisible.clear();
-        for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
-            m_scatterVisible.push_back(i);
-        m_lastAabbTests = 0;
-        finishTiming();
-        return;
-    }
-
-    XMFLOAT4X4 vpCpu;
-    XMStoreFloat4x4(&vpCpu, vp);
-    const Frustum f = Frustum::FromViewProj(vpCpu);
-
-    if (m_useOctreeCulling && m_scatterOctreeBuilt)
-    {
-        m_lastAabbTests = m_scatterOctree.QueryVisible(f, m_scatterVisible);
-    }
-    else
-    {
-        m_scatterVisible.clear();
-        for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
-            if (f.Intersects(m_scatterInstances[i].WorldBounds))
-                m_scatterVisible.push_back(i);
-        m_lastAabbTests = static_cast<uint32_t>(m_scatterInstances.size());
-    }
-
-    finishTiming();
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::CurrentBackBufferRTV() const
