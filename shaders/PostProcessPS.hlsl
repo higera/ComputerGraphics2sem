@@ -11,7 +11,8 @@ cbuffer PostCB : register(b0)
 Texture2D gAlbedoSpecTex : register(t0);
 Texture2D gNormalTex     : register(t1);
 Texture2D gDepthTex      : register(t2);
-Texture2D gSceneColor    : register(t3);
+Texture2D gMaterialTex   : register(t3);
+Texture2D gSceneColor    : register(t4);
 
 SamplerState gLinearClamp : register(s0);
 
@@ -44,10 +45,14 @@ float4 PostProcessPS(FSOut pin) : SV_TARGET
             return float4(gAlbedoSpecTex.Load(coords).rgb, 1.f);
         if (gFlags.w < 2.5f)
             return float4(normalize(gNormalTex.Load(coords).xyz) * 0.5f + 0.5f, 1.f);
-        float ndc = gDepthTex.Load(coords).r;
-        if (ndc >= 1.f)
-            return float4(1.f, 1.f, 1.f, 1.f);
-        return float4(saturate(LinearizeDepth(ndc) / gDepthParams.z).xxx, 1.f);
+        if (gFlags.w < 3.5f)
+        {
+            float ndc = gDepthTex.Load(coords).r;
+            if (ndc >= 1.f)
+                return float4(1.f, 1.f, 1.f, 1.f);
+            return float4(saturate(LinearizeDepth(ndc) / gDepthParams.z).xxx, 1.f);
+        }
+        return float4(gMaterialTex.Load(coords).rgb, 1.f);
     }
 
     float3 color;

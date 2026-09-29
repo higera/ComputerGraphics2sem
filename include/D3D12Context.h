@@ -33,6 +33,8 @@ public:
 
     void SetPostEffects(bool vignette, bool chroma, bool toneMapping, int debugView);
 
+    void SetPbrDebug(int materialOverride, bool iblOn, bool directOn);
+
     void ToggleEmitter();
     void TogglePauseParticles();
     void ScaleEmitRate(float factor);

@@ -26,7 +26,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
     m_input = std::make_unique<Input>();
     m_input->Reset();
 
-    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-7: Post-processing"))
+    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-8: PBR + IBL"))
         return false;
 
     m_dx12 = std::make_unique<D3D12Context>();
@@ -76,16 +76,6 @@ void App::Update(float dt)
         m_exitRequested = true;
 
     if (!m_input || !m_dx12 || !m_window) return;
-
-    const float sunTurnSpeed = 1.0f;
-    float sunAzimuth = 0.f;
-    float sunHeight = 0.f;
-    if (m_input->IsKeyDown(VK_LEFT))  sunAzimuth -= sunTurnSpeed * dt;
-    if (m_input->IsKeyDown(VK_RIGHT)) sunAzimuth += sunTurnSpeed * dt;
-    if (m_input->IsKeyDown(VK_UP))    sunHeight  += sunTurnSpeed * dt;
-    if (m_input->IsKeyDown(VK_DOWN))  sunHeight  -= sunTurnSpeed * dt;
-    if (sunAzimuth != 0.f || sunHeight != 0.f)
-        m_dx12->RotateSun(sunAzimuth, sunHeight);
 
     if (m_input->IsKeyDown(VK_RBUTTON))
     {
@@ -146,18 +136,19 @@ void App::UpdateWindowTitle(float dt)
     m_fpsTimer = 0.f;
     m_fpsFrames = 0;
 
-    static const wchar_t* kDebugNames[] = { L"off", L"albedo", L"normals", L"depth" };
+    static const wchar_t* kDebugNames[] = { L"off", L"albedo", L"normals", L"depth", L"material" };
+    static const wchar_t* kMaterialNames[] = { L"as is", L"chrome", L"rough", L"glossy" };
 
     wchar_t buf[256];
     swprintf(buf, 256,
-        L"Lab-7 Post | FPS %.0f | F1 vignette %ls | F2 chroma %ls | F3 G-buffer: %ls | F4 tonemap %ls | "
-        L"particles %u",
+        L"Lab-8 PBR | FPS %.0f | F5 material: %ls | F6 IBL %ls | F7 direct %ls | F3 G-buffer: %ls | "
+        L"F4 tonemap %ls | F1/F2 vignette/chroma",
         m_fps,
-        m_vignetteOn ? L"ON" : L"OFF",
-        m_chromaOn ? L"ON" : L"OFF",
+        kMaterialNames[m_pbrOverride],
+        m_iblOn ? L"ON" : L"OFF",
+        m_directOn ? L"ON" : L"OFF",
         kDebugNames[m_debugView],
-        m_toneMapOn ? L"ACES" : L"OFF",
-        m_dx12->AliveParticles());
+        m_toneMapOn ? L"ACES" : L"OFF");
     SetWindowTextW(m_window->GetHwnd(), buf);
 }
 
@@ -182,9 +173,14 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
             if (wparam == VK_F1) m_vignetteOn = !m_vignetteOn;
             if (wparam == VK_F2) m_chromaOn = !m_chromaOn;
-            if (wparam == VK_F3) m_debugView = (m_debugView + 1) % 4;
+            if (wparam == VK_F3) m_debugView = (m_debugView + 1) % 5;
             if (wparam == VK_F4) m_toneMapOn = !m_toneMapOn;
             m_dx12->SetPostEffects(m_vignetteOn, m_chromaOn, m_toneMapOn, m_debugView);
+
+            if (wparam == VK_F5) m_pbrOverride = (m_pbrOverride + 1) % 4;
+            if (wparam == VK_F6) m_iblOn = !m_iblOn;
+            if (wparam == VK_F7) m_directOn = !m_directOn;
+            m_dx12->SetPbrDebug(m_pbrOverride, m_iblOn, m_directOn);
 
             if (wparam == 'R')        m_dx12->ToggleEmitter();
             if (wparam == VK_SPACE)   m_dx12->TogglePauseParticles();

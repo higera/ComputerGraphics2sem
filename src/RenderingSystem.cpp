@@ -333,7 +333,19 @@ namespace
         XMFLOAT3 ks{ 0.18f, 0.18f, 0.18f };
         float ns = 32.f;
         bool hasAlphaMask = false;
+        std::string normalPath;
+        std::string metalRoughPath;
+        float metallic = 0.f;
+        float roughness = -1.f;
     };
+
+    std::string LastToken(std::istringstream& stream)
+    {
+        std::string token, last;
+        while (stream >> token)
+            last = token;
+        return last;
+    }
 
     std::unordered_map<std::string, MtlData> LoadMtlData(const std::string& mtlPath)
     {
@@ -379,6 +391,26 @@ namespace
                     last = token;
                 if (!last.empty())
                     materials[currentMaterial].diffusePath = JoinPath(baseDir, last);
+            }
+            else if (command == "Pm" && !currentMaterial.empty())
+            {
+                stream >> materials[currentMaterial].metallic;
+            }
+            else if (command == "Pr" && !currentMaterial.empty())
+            {
+                stream >> materials[currentMaterial].roughness;
+            }
+            else if ((command == "map_Disp" || command == "map_Bump" || command == "map_bump" || command == "bump" || command == "norm") && !currentMaterial.empty())
+            {
+                const std::string last = LastToken(stream);
+                if (!last.empty())
+                    materials[currentMaterial].normalPath = JoinPath(baseDir, last);
+            }
+            else if (command == "map_MR" && !currentMaterial.empty())
+            {
+                const std::string last = LastToken(stream);
+                if (!last.empty())
+                    materials[currentMaterial].metalRoughPath = JoinPath(baseDir, last);
             }
             else if (command == "map_d" && !currentMaterial.empty())
             {
@@ -606,6 +638,38 @@ namespace
         return !out.vertices.empty() && !out.indices.empty();
     }
 
+    bool AppendObjMesh(ObjMesh& dst, const std::string& path, CXMMATRIX transform)
+    {
+        ObjMesh src{};
+        if (!LoadObj(path, src))
+        {
+            OutputDebugStringA(("BuildGeometry: cannot load " + path + ", skipping\n").c_str());
+            return false;
+        }
+
+        const uint32_t vertexOffset = static_cast<uint32_t>(dst.vertices.size());
+        const uint32_t indexOffset = static_cast<uint32_t>(dst.indices.size());
+
+        dst.vertices.reserve(dst.vertices.size() + src.vertices.size());
+        for (const RenderingSystem::Vertex& v : src.vertices)
+        {
+            RenderingSystem::Vertex out = v;
+            XMStoreFloat3(&out.Pos, XMVector3TransformCoord(XMLoadFloat3(&v.Pos), transform));
+            XMStoreFloat3(&out.Normal, XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&v.Normal), transform)));
+            dst.vertices.push_back(out);
+        }
+
+        dst.indices.reserve(dst.indices.size() + src.indices.size());
+        for (uint32_t index : src.indices)
+            dst.indices.push_back(index + vertexOffset);
+
+        for (const ObjGroup& group : src.groups)
+            dst.groups.push_back({ group.start + indexOffset, group.count, group.material });
+
+        dst.materials.insert(src.materials.begin(), src.materials.end());
+        return true;
+    }
+
     uint32_t MipCount(uint32_t width, uint32_t height)
     {
         uint32_t count = 1;
@@ -722,6 +786,169 @@ namespace
         uploadResources.push_back(uploadBuffer);
     }
 
+    struct DdsHeader
+    {
+        uint32_t magic, size, flags, height, width, pitchOrLinearSize, depth, mipCount, reserved1[11];
+        uint32_t pfSize, pfFlags, pfFourCC, pfBitCount, pfRMask, pfGMask, pfBMask, pfAMask;
+        uint32_t caps, caps2, caps3, caps4, reserved2;
+    };
+
+    struct DdsHeaderDx10
+    {
+        uint32_t format, dimension, miscFlag, arraySize, miscFlags2;
+    };
+
+    struct DdsImage
+    {
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        uint32_t width = 0, height = 0, mipLevels = 1, arraySize = 1;
+        bool isCube = false;
+        std::vector<uint8_t> data;
+    };
+
+    uint32_t BytesPerPixel(DXGI_FORMAT format)
+    {
+        switch (format)
+        {
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+        case DXGI_FORMAT_R32G32_FLOAT:       return 8;
+        case DXGI_FORMAT_R16G16_FLOAT:       return 4;
+        case DXGI_FORMAT_R8G8B8A8_UNORM:     return 4;
+        default:                             return 0;
+        }
+    }
+
+    bool LoadDds(const std::string& path, DdsImage& out)
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open())
+            return false;
+
+        DdsHeader header{};
+        DdsHeaderDx10 dx10{};
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!file || header.magic != 0x20534444u || header.pfFourCC != 0x30315844u)
+            return false;
+        file.read(reinterpret_cast<char*>(&dx10), sizeof(dx10));
+        if (!file)
+            return false;
+
+        out.format = static_cast<DXGI_FORMAT>(dx10.format);
+        out.width = header.width;
+        out.height = header.height;
+        out.mipLevels = std::max(1u, header.mipCount);
+        out.isCube = (dx10.miscFlag & 0x4u) != 0;
+        out.arraySize = out.isCube ? 6u : std::max(1u, dx10.arraySize);
+
+        const uint32_t bpp = BytesPerPixel(out.format);
+        if (bpp == 0)
+            return false;
+
+        size_t total = 0;
+        for (uint32_t w = out.width, h = out.height, m = 0; m < out.mipLevels; ++m, w = std::max(1u, w / 2), h = std::max(1u, h / 2))
+            total += static_cast<size_t>(w) * h * bpp;
+        total *= out.arraySize;
+
+        out.data.resize(total);
+        file.read(reinterpret_cast<char*>(out.data.data()), static_cast<std::streamsize>(total));
+        return static_cast<bool>(file);
+    }
+
+    DdsImage MakeFallbackCube()
+    {
+        const float sky[4] = { 0.12f, 0.14f, 0.18f, 1.f };
+        DdsImage image;
+        image.format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        image.width = image.height = 1;
+        image.arraySize = 6;
+        image.isCube = true;
+        image.data.resize(6 * sizeof(sky));
+        for (int face = 0; face < 6; ++face)
+            std::memcpy(image.data.data() + face * sizeof(sky), sky, sizeof(sky));
+        return image;
+    }
+
+    DdsImage MakeFallbackLut()
+    {
+        DdsImage image;
+        image.format = DXGI_FORMAT_R16G16_FLOAT;
+        image.width = image.height = 1;
+        image.data = { 0x00, 0x3C, 0x00, 0x00 };
+        return image;
+    }
+
+    ComPtr<ID3D12Resource> UploadDds(
+        ID3D12Device* device,
+        ID3D12GraphicsCommandList* commandList,
+        const DdsImage& image,
+        std::vector<ComPtr<ID3D12Resource>>& uploadResources)
+    {
+        D3D12_RESOURCE_DESC desc = TextureDesc2D(image.width, image.height, image.format, image.mipLevels);
+        desc.DepthOrArraySize = static_cast<UINT16>(image.arraySize);
+
+        auto defaultHeap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+        ComPtr<ID3D12Resource> texture;
+        ThrowIfFailed(
+            device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)),
+            "Create IBL texture");
+
+        const uint32_t subresourceCount = image.mipLevels * image.arraySize;
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(subresourceCount);
+        std::vector<UINT> numRows(subresourceCount);
+        std::vector<UINT64> rowSizes(subresourceCount);
+        UINT64 totalBytes = 0;
+        device->GetCopyableFootprints(&desc, 0, subresourceCount, 0, footprints.data(), numRows.data(), rowSizes.data(), &totalBytes);
+
+        auto uploadHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        const D3D12_RESOURCE_DESC uploadDesc = BufferDesc(totalBytes);
+        ComPtr<ID3D12Resource> uploadBuffer;
+        ThrowIfFailed(
+            device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer)),
+            "Create IBL upload buffer");
+
+        uint8_t* mapped = nullptr;
+        D3D12_RANGE readRange{ 0, 0 };
+        ThrowIfFailed(uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped)), "Map IBL upload buffer");
+
+        const uint8_t* src = image.data.data();
+        for (uint32_t s = 0; s < subresourceCount; ++s)
+        {
+            for (UINT row = 0; row < numRows[s]; ++row)
+            {
+                std::memcpy(mapped + footprints[s].Offset + static_cast<size_t>(row) * footprints[s].Footprint.RowPitch, src, static_cast<size_t>(rowSizes[s]));
+                src += rowSizes[s];
+            }
+        }
+        uploadBuffer->Unmap(0, nullptr);
+
+        for (uint32_t s = 0; s < subresourceCount; ++s)
+        {
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = texture.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = s;
+
+            D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+            srcLoc.pResource = uploadBuffer.Get();
+            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            srcLoc.PlacedFootprint = footprints[s];
+
+            commandList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+        }
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = texture.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        commandList->ResourceBarrier(1, &barrier);
+
+        uploadResources.push_back(uploadBuffer);
+        return texture;
+    }
+
     float Clamp01(float value)
     {
         return std::max(0.f, std::min(1.f, value));
@@ -776,6 +1003,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_gBuffer = std::make_unique<GBuffer>();
     m_gBuffer->Initialize(m_device.Get(), m_width, m_height);
     CreateSceneColor();
+    BuildIblResources();
 
     m_shadowMap = std::make_unique<ShadowMap>();
     m_shadowMap->Initialize(m_device.Get(), m_gBuffer->GetShadowSrvCpu());
@@ -936,7 +1164,7 @@ void RenderingSystem::Draw(float dt)
 
             for (const DrawItem& drawItem : m_drawItems)
             {
-                const bool isAlpha = drawItem.Material.SurfaceParams.z > 0.5f;
+                const bool isAlpha = drawItem.Material.SurfaceParams.w > 0.5f;
                 if (isAlpha != alphaPass)
                     continue;
                 if (m_shadowCulling && !cascadeFrustum.Intersects(drawItem.WorldBounds,  true))
@@ -977,7 +1205,15 @@ void RenderingSystem::Draw(float dt)
         D3D12_GPU_DESCRIPTOR_HANDLE textureHandle = textureHeapStart;
         textureHandle.ptr += static_cast<UINT64>(drawItem.TextureIndex) * m_srvDescriptorSize;
 
+        D3D12_GPU_DESCRIPTOR_HANDLE normalHandle = textureHeapStart;
+        normalHandle.ptr += static_cast<UINT64>(drawItem.NormalIndex) * m_srvDescriptorSize;
+
+        D3D12_GPU_DESCRIPTOR_HANDLE metalRoughHandle = textureHeapStart;
+        metalRoughHandle.ptr += static_cast<UINT64>(drawItem.MetalRoughIndex) * m_srvDescriptorSize;
+
         m_commandList->SetGraphicsRootDescriptorTable(1, textureHandle);
+        m_commandList->SetGraphicsRootDescriptorTable(7, normalHandle);
+        m_commandList->SetGraphicsRootDescriptorTable(8, metalRoughHandle);
         m_commandList->SetGraphicsRoot32BitConstants(2, 8, &drawItem.Material, 0);
         m_commandList->DrawIndexedInstanced(
             drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
@@ -1006,6 +1242,8 @@ void RenderingSystem::Draw(float dt)
     m_commandList->SetDescriptorHeaps(1, lightingHeaps);
     m_commandList->SetGraphicsRootDescriptorTable(4, m_gBuffer->GetSrvTable());
     m_commandList->SetGraphicsRootDescriptorTable(1, m_gBuffer->GetSrvTable());
+    m_commandList->SetGraphicsRootDescriptorTable(7, m_gBuffer->GetSrvTable());
+    m_commandList->SetGraphicsRootDescriptorTable(8, m_gBuffer->GetSrvTable());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->DrawInstanced(3, 1, 0, 0);
 
@@ -1227,12 +1465,35 @@ bool RenderingSystem::BuildRootSignature()
 
     D3D12_DESCRIPTOR_RANGE gbufferRange{};
     gbufferRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    gbufferRange.NumDescriptors = 4;
+    gbufferRange.NumDescriptors = GBuffer::TargetCount + 1;
     gbufferRange.BaseShaderRegister = 1;
     gbufferRange.RegisterSpace = 0;
     gbufferRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[7]{};
+    D3D12_DESCRIPTOR_RANGE iblRange{};
+    iblRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    iblRange.NumDescriptors = GBuffer::IblCount;
+    iblRange.BaseShaderRegister = 6;
+    iblRange.RegisterSpace = 0;
+    iblRange.OffsetInDescriptorsFromTableStart = GBuffer::IblFirstSlot;
+
+    D3D12_DESCRIPTOR_RANGE lightingRanges[2] = { gbufferRange, iblRange };
+
+    D3D12_DESCRIPTOR_RANGE normalMapRange{};
+    normalMapRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    normalMapRange.NumDescriptors = 1;
+    normalMapRange.BaseShaderRegister = 9;
+    normalMapRange.RegisterSpace = 0;
+    normalMapRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_DESCRIPTOR_RANGE metalRoughRange{};
+    metalRoughRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    metalRoughRange.NumDescriptors = 1;
+    metalRoughRange.BaseShaderRegister = 10;
+    metalRoughRange.RegisterSpace = 0;
+    metalRoughRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[9]{};
 
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
@@ -1256,8 +1517,8 @@ bool RenderingSystem::BuildRootSignature()
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[4].DescriptorTable.NumDescriptorRanges = 1;
-    params[4].DescriptorTable.pDescriptorRanges = &gbufferRange;
+    params[4].DescriptorTable.NumDescriptorRanges = _countof(lightingRanges);
+    params[4].DescriptorTable.pDescriptorRanges = lightingRanges;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1270,6 +1531,16 @@ bool RenderingSystem::BuildRootSignature()
     params[6].Constants.RegisterSpace = 0;
     params[6].Constants.Num32BitValues = 16;
     params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[7].DescriptorTable.NumDescriptorRanges = 1;
+    params[7].DescriptorTable.pDescriptorRanges = &normalMapRange;
+    params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[8].DescriptorTable.NumDescriptorRanges = 1;
+    params[8].DescriptorTable.pDescriptorRanges = &metalRoughRange;
+    params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
@@ -1300,12 +1571,30 @@ bool RenderingSystem::BuildRootSignature()
     shadowSampler.RegisterSpace = 0;
     shadowSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    D3D12_STATIC_SAMPLER_DESC samplers[2] = { sampler, shadowSampler };
+    D3D12_STATIC_SAMPLER_DESC iblCubeSampler{};
+    iblCubeSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    iblCubeSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    iblCubeSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    iblCubeSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    iblCubeSampler.MaxAnisotropy = 1;
+    iblCubeSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    iblCubeSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    iblCubeSampler.MinLOD = 0.f;
+    iblCubeSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    iblCubeSampler.ShaderRegister = 2;
+    iblCubeSampler.RegisterSpace = 0;
+    iblCubeSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC brdfLutSampler = iblCubeSampler;
+    brdfLutSampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    brdfLutSampler.ShaderRegister = 3;
+
+    D3D12_STATIC_SAMPLER_DESC samplers[4] = { sampler, shadowSampler, iblCubeSampler, brdfLutSampler };
 
     D3D12_ROOT_SIGNATURE_DESC desc{};
     desc.NumParameters = static_cast<UINT>(_countof(params));
     desc.pParameters = params;
-    desc.NumStaticSamplers = 2;
+    desc.NumStaticSamplers = _countof(samplers);
     desc.pStaticSamplers = samplers;
     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -1369,10 +1658,11 @@ bool RenderingSystem::BuildPSOs()
     geometryPso.DepthStencilState = geometryDepth;
     geometryPso.InputLayout = { m_inputLayout, static_cast<UINT>(_countof(m_inputLayout)) };
     geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    geometryPso.NumRenderTargets = 3;
+    geometryPso.NumRenderTargets = GBuffer::TargetCount;
     geometryPso.RTVFormats[0] = m_gBuffer->GetAlbedoSpecFormat();
     geometryPso.RTVFormats[1] = m_gBuffer->GetNormalFormat();
     geometryPso.RTVFormats[2] = m_gBuffer->GetDepthValueFormat();
+    geometryPso.RTVFormats[3] = m_gBuffer->GetMaterialFormat();
     geometryPso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
     geometryPso.SampleDesc.Count = 1;
     geometryPso.SampleDesc.Quality = 0;
@@ -1470,17 +1760,41 @@ bool RenderingSystem::BuildGeometry()
     if (!LoadObj(ResolveAssetPath("sponza/sponza.obj"), model))
         throw std::runtime_error("Failed to load sponza.obj");
 
+    const XMMATRIX cerberusTransform =
+        XMMatrixRotationY(XM_PIDIV2) *
+        XMMatrixScaling(100.f, 100.f, 100.f) *
+        XMMatrixTranslation(-100.f, 130.f, 150.f);
+    AppendObjMesh(model, ResolveAssetPath("models/cerberus/cerberus.obj"), cerberusTransform);
+
     std::unordered_map<std::string, uint32_t> pathToIndex;
     std::vector<std::string> uniquePaths;
 
-    auto getTextureIndex = [&](const std::string& path) -> uint32_t
+    enum class TexKind { Albedo, Normal, MetalRough };
+    std::vector<TexKind> uniqueKind;
+
+    constexpr uint32_t kWhiteSlot = 0;
+    constexpr uint32_t kFlatNormalSlot = 1;
+    constexpr uint32_t kNeutralMrSlot = 2;
+    constexpr uint32_t kFirstFileSlot = 3;
+
+    auto getTextureIndex = [&](const std::string& path, TexKind kind) -> uint32_t
     {
         if (path.empty())
-            return 0;
+        {
+            switch (kind)
+            {
+            case TexKind::Normal:     return kFlatNormalSlot;
+            case TexKind::MetalRough: return kNeutralMrSlot;
+            default:                  return kWhiteSlot;
+            }
+        }
 
-        auto [it, inserted] = pathToIndex.emplace(path, static_cast<uint32_t>(uniquePaths.size()) + 1u);
+        auto [it, inserted] = pathToIndex.emplace(path, static_cast<uint32_t>(uniquePaths.size()) + kFirstFileSlot);
         if (inserted)
+        {
             uniquePaths.push_back(path);
+            uniqueKind.push_back(kind);
+        }
         return it->second;
     };
 
@@ -1504,12 +1818,14 @@ bool RenderingSystem::BuildGeometry()
         if (materialIt != model.materials.end())
         {
             const MtlData& material = materialIt->second;
-            drawItem.TextureIndex = getTextureIndex(material.diffusePath);
+            drawItem.TextureIndex = getTextureIndex(material.diffusePath, TexKind::Albedo);
+            drawItem.NormalIndex = getTextureIndex(material.normalPath, TexKind::Normal);
+            drawItem.MetalRoughIndex = getTextureIndex(material.metalRoughPath, TexKind::MetalRough);
             drawItem.Material.BaseColor = XMFLOAT4(material.kd.x, material.kd.y, material.kd.z, 1.f);
-            const float ksAverage = (material.ks.x + material.ks.y + material.ks.z) / 3.f;
-            drawItem.Material.SurfaceParams.x = std::max(0.04f, ksAverage);
-            drawItem.Material.SurfaceParams.y = std::max(8.f, std::min(material.ns, 128.f));
-            drawItem.Material.SurfaceParams.z = material.hasAlphaMask ? 1.f : 0.f;
+
+            const float roughness = (material.roughness >= 0.f) ? material.roughness : std::sqrt(2.f / (material.ns + 2.f));
+            drawItem.Material.SurfaceParams = XMFLOAT4(Clamp01(material.metallic), std::max(0.05f, Clamp01(roughness)), 1.f,
+                                                       material.hasAlphaMask ? 1.f : 0.f);
         }
 
         m_drawItems.push_back(drawItem);
@@ -1567,14 +1883,26 @@ bool RenderingSystem::BuildGeometry()
     };
 
     m_textures.clear();
-    m_textures.resize(uniquePaths.size() + 1u);
-    m_textures[0] = createTexture(1, 1);
+    m_textures.resize(uniquePaths.size() + kFirstFileSlot);
+    m_textures[kWhiteSlot] = createTexture(1, 1);
+    m_textures[kFlatNormalSlot] = createTexture(1, 1);
+    m_textures[kNeutralMrSlot] = createTexture(1, 1);
+
+    auto fallbackSlotFor = [&](TexKind kind) -> uint32_t
+    {
+        switch (kind)
+        {
+        case TexKind::Normal:     return kFlatNormalSlot;
+        case TexKind::MetalRough: return kNeutralMrSlot;
+        default:                  return kWhiteSlot;
+        }
+    };
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            m_textures[i + 1] = createTexture(images[i].width, images[i].height);
+            m_textures[i + kFirstFileSlot] = createTexture(images[i].width, images[i].height);
         else
-            m_textures[i + 1] = m_textures[0];
+            m_textures[i + kFirstFileSlot] = m_textures[fallbackSlotFor(uniqueKind[i])];
     }
 
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator for geometry upload");
@@ -1603,12 +1931,24 @@ bool RenderingSystem::BuildGeometry()
     whiteTexture.width = 1;
     whiteTexture.height = 1;
     whiteTexture.bgra = { 255, 255, 255, 255 };
-    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[0].Get(), whiteTexture, textureUploads);
+    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[kWhiteSlot].Get(), whiteTexture, textureUploads);
+
+    Image flatNormalTexture;
+    flatNormalTexture.width = 1;
+    flatNormalTexture.height = 1;
+    flatNormalTexture.bgra = { 255, 128, 128, 255 };
+    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[kFlatNormalSlot].Get(), flatNormalTexture, textureUploads);
+
+    Image neutralMrTexture;
+    neutralMrTexture.width = 1;
+    neutralMrTexture.height = 1;
+    neutralMrTexture.bgra = { 0, 255, 255, 255 };
+    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[kNeutralMrSlot].Get(), neutralMrTexture, textureUploads);
 
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + 1].Get(), images[i], textureUploads);
+            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + kFirstFileSlot].Get(), images[i], textureUploads);
     }
 
     ThrowIfFailed(m_commandList->Close(), "Close geometry upload command list");
@@ -1642,6 +1982,57 @@ bool RenderingSystem::BuildGeometry()
         srvHandle.ptr += m_srvDescriptorSize;
     }
 
+    return true;
+}
+
+bool RenderingSystem::BuildIblResources()
+{
+    struct IblFile { const char* path; bool isCube; };
+    const IblFile files[GBuffer::IblCount] = {
+        { "ibl/irradiance.dds", true },
+        { "ibl/prefilter.dds",  true },
+        { "ibl/brdf_lut.dds",   false },
+    };
+
+    ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator for IBL upload");
+    ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset command list for IBL upload");
+
+    std::vector<ComPtr<ID3D12Resource>> uploads;
+    ComPtr<ID3D12Resource>* targets[GBuffer::IblCount] = { &m_irradianceMap, &m_prefilterMap, &m_brdfLut };
+
+    for (uint32_t i = 0; i < GBuffer::IblCount; ++i)
+    {
+        DdsImage image;
+        const bool ok = LoadDds(ResolveAssetPath(files[i].path), image) && image.isCube == files[i].isCube;
+        if (!ok)
+        {
+            OutputDebugStringA((std::string("IBL: cannot load ") + files[i].path + ", using 1x1 fallback\n").c_str());
+            image = files[i].isCube ? MakeFallbackCube() : MakeFallbackLut();
+        }
+
+        *targets[i] = UploadDds(m_device.Get(), m_commandList.Get(), image, uploads);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = image.format;
+        if (image.isCube)
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            srv.TextureCube.MostDetailedMip = 0;
+            srv.TextureCube.MipLevels = image.mipLevels;
+        }
+        else
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Texture2D.MipLevels = image.mipLevels;
+        }
+        m_device->CreateShaderResourceView(targets[i]->Get(), &srv, m_gBuffer->GetIblSrvCpu(i));
+    }
+
+    ThrowIfFailed(m_commandList->Close(), "Close IBL upload command list");
+    ID3D12CommandList* lists[] = { m_commandList.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    FlushCommandQueue();
     return true;
 }
 
@@ -1716,7 +2107,7 @@ void RenderingSystem::UpdateLightConstants(float dt)
     m_time += dt;
 
     LightConstants constants{};
-    constants.AmbientColor = XMFLOAT4(0.18f, 0.19f, 0.22f, 1.f);
+    constants.PbrDebug = XMFLOAT4(static_cast<float>(m_pbrOverride), m_iblOn ? 1.f : 0.f, m_directOn ? 1.f : 0.f, 0.f);
 
     const uint32_t lightCount = static_cast<uint32_t>(std::min<size_t>(m_sceneLights.size(), MaxLights));
     constants.LightCount = XMFLOAT4(static_cast<float>(lightCount), 0.f, 0.f, 0.f);
@@ -1751,6 +2142,13 @@ void RenderingSystem::RotateSun(float deltaAzimuth, float deltaHeight)
 
     if (!m_sceneLights.empty())
         m_sceneLights[0].DirectionSpot = XMFLOAT4(m_sunDir.x, m_sunDir.y, m_sunDir.z, 0.f);
+}
+
+void RenderingSystem::SetPbrDebug(int materialOverride, bool iblOn, bool directOn)
+{
+    m_pbrOverride = materialOverride;
+    m_iblOn = iblOn;
+    m_directOn = directOn;
 }
 
 void RenderingSystem::SetPostEffects(bool vignette, bool chroma, bool toneMapping, int debugView)
@@ -1929,9 +2327,9 @@ void RenderingSystem::CreateSceneLights()
 
     m_sceneLights.clear();
 
-    m_sceneLights.push_back(makeDirectional(m_sunDir, XMFLOAT3(1.0f, 0.93f, 0.80f), 1.7f, true));
+    m_sceneLights.push_back(makeDirectional(m_sunDir, XMFLOAT3(1.0f, 0.93f, 0.80f), 1.7f * XM_PI, true));
 
-    m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.30f, -0.45f, -0.85f), XMFLOAT3(0.55f, 0.65f, 0.95f), 0.45f, false));
+    m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.30f, -0.45f, -0.85f), XMFLOAT3(0.55f, 0.65f, 0.95f), 0.45f * XM_PI, false));
 
 }
 

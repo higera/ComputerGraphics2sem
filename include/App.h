@@ -39,6 +39,10 @@ private:
     bool m_toneMapOn = true;
     int  m_debugView = 0;
 
+    int  m_pbrOverride = 0;
+    bool m_iblOn = true;
+    bool m_directOn = true;
+
     float m_fpsTimer = 0.f;
     uint32_t m_fpsFrames = 0;
     float m_fps = 0.f;

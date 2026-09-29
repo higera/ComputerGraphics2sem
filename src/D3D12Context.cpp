@@ -67,3 +67,9 @@ void D3D12Context::SetPostEffects(bool vignette, bool chroma, bool toneMapping, 
     if (m_renderer)
         m_renderer->SetPostEffects(vignette, chroma, toneMapping, debugView);
 }
+
+void D3D12Context::SetPbrDebug(int materialOverride, bool iblOn, bool directOn)
+{
+    if (m_renderer)
+        m_renderer->SetPbrDebug(materialOverride, iblOn, directOn);
+}

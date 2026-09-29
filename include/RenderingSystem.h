@@ -57,6 +57,8 @@ public:
 
     void SetPostEffects(bool vignette, bool chroma, bool toneMapping, int debugView);
 
+    void SetPbrDebug(int materialOverride, bool iblOn, bool directOn);
+
     void ToggleEmitter();
     void TogglePauseParticles();
     void ScaleEmitRate(float factor);
@@ -69,7 +71,7 @@ private:
     struct MaterialConstants
     {
         DirectX::XMFLOAT4 BaseColor{ 1.f, 1.f, 1.f, 1.f };
-        DirectX::XMFLOAT4 SurfaceParams{ 0.18f, 32.f, 0.f, 0.f };
+        DirectX::XMFLOAT4 SurfaceParams{ 0.f, 0.5f, 1.f, 0.f };
     };
 
     struct DrawItem
@@ -77,6 +79,8 @@ private:
         uint32_t IndexCount = 0;
         uint32_t StartIndexLocation = 0;
         uint32_t TextureIndex = 0;
+        uint32_t NormalIndex = 1;
+        uint32_t MetalRoughIndex = 2;
         MaterialConstants Material;
         AABB WorldBounds;
     };
@@ -112,7 +116,7 @@ private:
 
     struct alignas(16) LightConstants
     {
-        DirectX::XMFLOAT4 AmbientColor{ 0.05f, 0.05f, 0.06f, 1.f };
+        DirectX::XMFLOAT4 PbrDebug{ 0.f, 1.f, 1.f, 0.f };
         DirectX::XMFLOAT4 LightCount{ 0.f, 0.f, 0.f, 0.f };
         GpuLight Lights[MaxLights]{};
     };
@@ -137,6 +141,7 @@ private:
     void FlushCommandQueue();
 
     bool BuildPostRootSignature();
+    bool BuildIblResources();
     void CreateSceneColor();
 
     D3D12_CPU_DESCRIPTOR_HANDLE CurrentBackBufferRTV() const;
@@ -211,6 +216,14 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_postConstantBuffer;
     uint8_t* m_mappedPostConstants = nullptr;
     PostConstants m_post;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_irradianceMap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_prefilterMap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_brdfLut;
+
+    int  m_pbrOverride = 0;
+    bool m_iblOn = true;
+    bool m_directOn = true;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
 

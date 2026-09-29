@@ -7,7 +7,7 @@
 class GBuffer
 {
 public:
-    static constexpr uint32_t TargetCount = 3;
+    static constexpr uint32_t TargetCount = 4;
 
     bool Initialize(ID3D12Device* device, uint32_t width, uint32_t height);
     void Shutdown();
@@ -28,6 +28,16 @@ public:
         return h;
     }
 
+    static constexpr uint32_t IblFirstSlot = TargetCount + 2;
+    static constexpr uint32_t IblCount = 3;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE GetIblSrvCpu(uint32_t index) const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(IblFirstSlot + index) * m_srvDescriptorSize;
+        return h;
+    }
+
     D3D12_CPU_DESCRIPTOR_HANDLE GetSceneColorSrvCpu() const
     {
         D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -39,6 +49,7 @@ public:
     DXGI_FORMAT GetNormalFormat() const { return DXGI_FORMAT_R16G16B16A16_FLOAT; }
     DXGI_FORMAT GetDepthValueFormat() const { return DXGI_FORMAT_R32_FLOAT; }
     DXGI_FORMAT GetDepthStencilFormat() const { return DXGI_FORMAT_D32_FLOAT; }
+    DXGI_FORMAT GetMaterialFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
 
 private:
     void CreateResources(ID3D12Device* device);
