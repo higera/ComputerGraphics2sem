@@ -17,6 +17,7 @@ add_executable(dx12_textures
         src/Frustum.cpp
         src/Octree.cpp
         src/ShadowMap.cpp
+        src/ParticleSystem.cpp
 )
 
 # 2. Заголовки (.h) — ищем в папке include

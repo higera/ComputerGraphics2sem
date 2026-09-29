@@ -53,3 +53,11 @@ bool D3D12Context::ShadowCullingOn() const { return m_renderer ? m_renderer->Sha
 float D3D12Context::GetSplitLambda() const { return m_renderer ? m_renderer->GetSplitLambda() : 0.f; }
 DirectX::XMFLOAT4 D3D12Context::GetCascadeSplits() const { return m_renderer ? m_renderer->GetCascadeSplits() : DirectX::XMFLOAT4{}; }
 uint32_t D3D12Context::ShadowDrawCalls() const { return m_renderer ? m_renderer->ShadowDrawCalls() : 0; }
+
+void D3D12Context::ToggleEmitter()               { if (m_renderer) m_renderer->ToggleEmitter(); }
+void D3D12Context::TogglePauseParticles()        { if (m_renderer) m_renderer->TogglePauseParticles(); }
+void D3D12Context::ScaleEmitRate(float factor)   { if (m_renderer) m_renderer->ScaleEmitRate(factor); }
+bool D3D12Context::EmitterOn() const             { return m_renderer ? m_renderer->EmitterOn() : false; }
+bool D3D12Context::ParticlesPaused() const       { return m_renderer ? m_renderer->ParticlesPaused() : false; }
+float D3D12Context::EmitRate() const             { return m_renderer ? m_renderer->EmitRate() : 0.f; }
+uint32_t D3D12Context::AliveParticles() const    { return m_renderer ? m_renderer->AliveParticles() : 0; }

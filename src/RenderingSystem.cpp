@@ -1,6 +1,7 @@
 #include "RenderingSystem.h"
 #include "GBuffer.h"
 #include "ShadowMap.h"
+#include "ParticleSystem.h"
 
 #include <stdexcept>
 #include <cstdio>
@@ -777,6 +778,9 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_shadowMap = std::make_unique<ShadowMap>();
     m_shadowMap->Initialize(m_device.Get(), m_gBuffer->GetShadowSrvCpu());
 
+    m_particles = std::make_unique<ParticleSystem>();
+    m_particles->Initialize(m_device.Get(), m_commandQueue.Get(), ToWide(ResolveAssetPath("shaders/ParticleCS.hlsl")));
+
     CreateSceneLights();
     UpdatePassConstants();
     UpdateLightConstants(0.f);
@@ -811,6 +815,12 @@ void RenderingSystem::Shutdown()
     {
         m_shadowMap->Shutdown();
         m_shadowMap.reset();
+    }
+
+    if (m_particles)
+    {
+        m_particles->Shutdown();
+        m_particles.reset();
     }
 
     if (m_gBuffer)
@@ -878,6 +888,9 @@ void RenderingSystem::Draw(float dt)
     m_commandList->RSSetViewports(1, &m_viewport);
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+
+    m_particles->Simulate(m_commandList.Get(), dt);
+    m_particles->PrepareDraw(m_commandList.Get());
 
     m_shadowMap->TransitionToWrite(m_commandList.Get());
 
@@ -982,13 +995,25 @@ void RenderingSystem::Draw(float dt)
     ID3D12DescriptorHeap* lightingHeaps[] = { m_gBuffer->GetSrvHeap() };
     m_commandList->SetDescriptorHeaps(1, lightingHeaps);
     m_commandList->SetGraphicsRootDescriptorTable(4, m_gBuffer->GetSrvTable());
+    m_commandList->SetGraphicsRootDescriptorTable(1, m_gBuffer->GetSrvTable());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->DrawInstanced(3, 1, 0, 0);
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE sceneDsv = m_gBuffer->GetDsv();
+    m_commandList->OMSetRenderTargets(1, &backBufferRtv, FALSE, &sceneDsv);
+    m_commandList->SetPipelineState(m_particlePSO.Get());
+    m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    const D3D12_VERTEX_BUFFER_VIEW particleVbv = m_particles->GetVertexBufferView();
+    m_commandList->IASetVertexBuffers(0, 1, &particleVbv);
+    m_commandList->ExecuteIndirect(m_particles->GetDrawSignature(), 1, m_particles->GetIndirectArgs(), 0, nullptr, 0);
 
     D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     m_commandList->ResourceBarrier(1, &toPresent);
+
+    m_particles->FinishFrame(m_commandList.Get());
 
     ThrowIfFailed(m_commandList->Close(), "Close command list");
     ID3D12CommandList* lists[] = { m_commandList.Get() };
@@ -1118,6 +1143,23 @@ bool RenderingSystem::BuildShaders()
     compile("LightingPS", "ps_5_0", m_lightingPS);
     compile("ShadowVS", "vs_5_0", m_shadowVS);
     compile("ShadowAlphaPS", "ps_5_0", m_shadowAlphaPS);
+
+    const std::wstring particlePath = ToWide(ResolveAssetPath("shaders/ParticleRender.hlsl"));
+    auto compileParticle = [&](const char* entryPoint, const char* target, ComPtr<ID3DBlob>& bytecode)
+    {
+        errors.Reset();
+        const HRESULT hr = D3DCompileFromFile(particlePath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            entryPoint, target, compileFlags, 0, &bytecode, &errors);
+        if (FAILED(hr))
+        {
+            if (errors)
+                throw std::runtime_error(static_cast<const char*>(errors->GetBufferPointer()));
+            ThrowIfFailed(hr, entryPoint);
+        }
+    };
+    compileParticle("ParticleVS", "vs_5_0", m_particleVS);
+    compileParticle("ParticleGS", "gs_5_0", m_particleGS);
+    compileParticle("ParticlePS", "ps_5_0", m_particlePS);
 
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
@@ -1328,6 +1370,32 @@ bool RenderingSystem::BuildPSOs()
     shadowPso.PS = { m_shadowAlphaPS->GetBufferPointer(), m_shadowAlphaPS->GetBufferSize() };
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&shadowPso, IID_PPV_ARGS(&m_shadowAlphaPSO)), "Create alpha-tested shadow PSO");
 
+    const D3D12_INPUT_ELEMENT_DESC particleLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "SIZE",     0, DXGI_FORMAT_R32_FLOAT,       0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "VELOCITY", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "LIFETIME", 0, DXGI_FORMAT_R32_FLOAT,       0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_RASTERIZER_DESC particleRaster = rasterizer;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC particlePso{};
+    particlePso.pRootSignature = m_rootSignature.Get();
+    particlePso.VS = { m_particleVS->GetBufferPointer(), m_particleVS->GetBufferSize() };
+    particlePso.GS = { m_particleGS->GetBufferPointer(), m_particleGS->GetBufferSize() };
+    particlePso.PS = { m_particlePS->GetBufferPointer(), m_particlePS->GetBufferSize() };
+    particlePso.BlendState = blend;
+    particlePso.SampleMask = UINT_MAX;
+    particlePso.RasterizerState = particleRaster;
+    particlePso.DepthStencilState = geometryDepth;
+    particlePso.InputLayout = { particleLayout, static_cast<UINT>(_countof(particleLayout)) };
+    particlePso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    particlePso.NumRenderTargets = 1;
+    particlePso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    particlePso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
+    particlePso.SampleDesc.Count = 1;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&particlePso, IID_PPV_ARGS(&m_particlePSO)), "Create particle PSO");
+
     return true;
 }
 
@@ -1396,8 +1464,8 @@ bool RenderingSystem::BuildGeometry()
             "Create default buffer");
     };
 
-    createBuffer(vbSize, D3D12_RESOURCE_STATE_COPY_DEST, m_vertexBuffer);
-    createBuffer(ibSize, D3D12_RESOURCE_STATE_COPY_DEST, m_indexBuffer);
+    createBuffer(vbSize, D3D12_RESOURCE_STATE_COMMON, m_vertexBuffer);
+    createBuffer(ibSize, D3D12_RESOURCE_STATE_COMMON, m_indexBuffer);
 
     auto createUploadBuffer = [&](UINT64 size, const void* data) -> ComPtr<ID3D12Resource>
     {
@@ -1606,6 +1674,18 @@ void RenderingSystem::RotateSun(float deltaAzimuth, float deltaHeight)
     if (!m_sceneLights.empty())
         m_sceneLights[0].DirectionSpot = XMFLOAT4(m_sunDir.x, m_sunDir.y, m_sunDir.z, 0.f);
 }
+
+void RenderingSystem::ToggleEmitter() { if (m_particles) m_particles->EmitterEnabled = !m_particles->EmitterEnabled; }
+void RenderingSystem::TogglePauseParticles() { if (m_particles) m_particles->Paused = !m_particles->Paused; }
+void RenderingSystem::ScaleEmitRate(float factor)
+{
+    if (m_particles)
+        m_particles->EmitRate = std::clamp(m_particles->EmitRate * factor, 250.f, 64000.f);
+}
+bool RenderingSystem::EmitterOn() const { return m_particles && m_particles->EmitterEnabled; }
+bool RenderingSystem::ParticlesPaused() const { return m_particles && m_particles->Paused; }
+float RenderingSystem::EmitRate() const { return m_particles ? m_particles->EmitRate : 0.f; }
+uint32_t RenderingSystem::AliveParticles() const { return m_particles ? m_particles->ReadAliveCount() : 0; }
 
 void RenderingSystem::ToggleCascadeDebug() { m_showCascades = !m_showCascades; }
 void RenderingSystem::TogglePcf()          { m_usePcf = !m_usePcf; }

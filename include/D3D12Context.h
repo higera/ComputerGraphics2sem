@@ -31,6 +31,14 @@ public:
     DirectX::XMFLOAT4 GetCascadeSplits() const;
     uint32_t ShadowDrawCalls() const;
 
+    void ToggleEmitter();
+    void TogglePauseParticles();
+    void ScaleEmitRate(float factor);
+    bool EmitterOn() const;
+    bool ParticlesPaused() const;
+    float EmitRate() const;
+    uint32_t AliveParticles() const;
+
 private:
     std::unique_ptr<RenderingSystem> m_renderer;
 };

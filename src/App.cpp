@@ -26,7 +26,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
     m_input = std::make_unique<Input>();
     m_input->Reset();
 
-    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-5: Cascaded Shadow Maps"))
+    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-6: GPU Particles"))
         return false;
 
     m_dx12 = std::make_unique<D3D12Context>();
@@ -146,16 +146,14 @@ void App::UpdateWindowTitle(float dt)
     m_fpsTimer = 0.f;
     m_fpsFrames = 0;
 
-    const DirectX::XMFLOAT4 splits = m_dx12->GetCascadeSplits();
     wchar_t buf[256];
     swprintf(buf, 256,
-        L"Lab-5 CSM | FPS %.0f | L: lambda %.2f, splits %.1f / %.1f / %.1f / %.1f m | "
-        L"P: PCF %ls | C: cascades %ls | K: cascade culling %ls (shadow draws %u)",
-        m_fps, m_dx12->GetSplitLambda(), splits.x, splits.y, splits.z, splits.w,
-        m_dx12->PcfOn() ? L"ON" : L"OFF",
-        m_dx12->CascadeDebugOn() ? L"ON" : L"OFF",
-        m_dx12->ShadowCullingOn() ? L"ON" : L"OFF",
-        m_dx12->ShadowDrawCalls());
+        L"Lab-6 Particles | FPS %.0f | Alive %u / 65536 | R: emitter %ls | [ ]: rate %.0f/s | Space: %ls | "
+        L"C/P/L/K: CSM",
+        m_fps, m_dx12->AliveParticles(),
+        m_dx12->EmitterOn() ? L"ON" : L"OFF",
+        m_dx12->EmitRate(),
+        m_dx12->ParticlesPaused() ? L"PAUSED" : L"running");
     SetWindowTextW(m_window->GetHwnd(), buf);
 }
 
@@ -177,6 +175,11 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             if (wparam == 'P') m_dx12->TogglePcf();
             if (wparam == 'K') m_dx12->ToggleShadowCulling();
             if (wparam == 'L') m_dx12->CycleSplitLambda();
+
+            if (wparam == 'R')        m_dx12->ToggleEmitter();
+            if (wparam == VK_SPACE)   m_dx12->TogglePauseParticles();
+            if (wparam == VK_OEM_4)   m_dx12->ScaleEmitRate(0.5f);
+            if (wparam == VK_OEM_6)   m_dx12->ScaleEmitRate(2.0f);
         }
         return 0;
 

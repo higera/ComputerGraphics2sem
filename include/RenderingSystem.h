@@ -18,6 +18,7 @@
 #include "Frustum.h"
 
 class GBuffer;
+class ParticleSystem;
 class ShadowMap;
 
 class RenderingSystem
@@ -53,6 +54,14 @@ public:
     float GetSplitLambda() const;
     DirectX::XMFLOAT4 GetCascadeSplits() const;
     uint32_t ShadowDrawCalls() const { return m_shadowDrawCalls; }
+
+    void ToggleEmitter();
+    void TogglePauseParticles();
+    void ScaleEmitRate(float factor);
+    bool EmitterOn() const;
+    bool ParticlesPaused() const;
+    float EmitRate() const;
+    uint32_t AliveParticles() const;
 
 private:
     struct MaterialConstants
@@ -156,12 +165,14 @@ private:
 
     std::unique_ptr<GBuffer> m_gBuffer;
     std::unique_ptr<ShadowMap> m_shadowMap;
+    std::unique_ptr<ParticleSystem> m_particles;
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowAlphaPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particlePSO;
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
@@ -169,6 +180,9 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_shadowVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_shadowAlphaPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleGS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particlePS;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
 
